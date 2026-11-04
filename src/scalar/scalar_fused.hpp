@@ -93,6 +93,20 @@ using scalar_average3_fn = void (*)(torch::Tensor& out, torch::Tensor const& u0,
                                     double w1, double w2);
 DECLARE_DISPATCH(scalar_average3_fn, call_scalar_average3);
 
+//! MeshBlockImpl's carry of a dry-density source into the scalars, added into
+//! ds: s_base = w0 s0 + w1 s + w2 base (the stage average), remove = (rho_base
+//! == 0 ? r : s_base / rho_base), carry = (dry < 0 ? remove : r), ds +=
+//! carry * dry. ds, s0, s, base, r: (nvar, nc3, nc2, nc1); rho_base, dry:
+//! (nc3, nc2, nc1). base may be ds itself (read before the add).
+using scalar_carry_dry_fn = void (*)(torch::Tensor& ds, torch::Tensor const& s0,
+                                     torch::Tensor const& s,
+                                     torch::Tensor const& base,
+                                     torch::Tensor const& r,
+                                     torch::Tensor const& rho_base,
+                                     torch::Tensor const& dry, double w0,
+                                     double w1, double w2);
+DECLARE_DISPATCH(scalar_carry_dry_fn, call_scalar_carry_dry);
+
 DECLARE_DISPATCH(scalar_theta_fn, call_scalar_theta);
 DECLARE_DISPATCH(scalar_theta_scale_fn, call_scalar_theta_scale);
 DECLARE_DISPATCH(scalar_divergence_fn, call_scalar_divergence);

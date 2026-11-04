@@ -666,6 +666,20 @@ void MeshBlockImpl::advance_local(Variables &vars, double dt, int stage) {
     if (!dry.defined() || !vars.count("scalar_r")) return;
     auto rho_base = pintg->forward(stage, _hydro_u0[IDN], hydro_u[IDN],
                                    fut_hydro_du[IDN] - dry);
+    auto const &r = vars.at("scalar_r");
+    if (scalar_fused_enabled() && scalar_s.is_cuda() &&
+        scalar_s.scalar_type() == torch::kFloat64 &&
+        fut_scalar_ds.is_contiguous() && _scalar_s0.is_contiguous() &&
+        scalar_s.is_contiguous() && scalar_base.is_contiguous() &&
+        r.is_contiguous()) {
+      // the same carry in one kernel (scalar_fused.cu)
+      auto const &w = pintg->stages[stage];
+      at::native::call_scalar_carry_dry(
+          fut_scalar_ds.device().type(), fut_scalar_ds, _scalar_s0, scalar_s,
+          scalar_base, r, rho_base.contiguous(), dry.contiguous(), w.wght0(),
+          w.wght1(), w.wght2());
+      return;
+    }
     auto s_base = pintg->forward(stage, _scalar_s0, scalar_s, scalar_base);
     auto remove_r =
         torch::where(rho_base.unsqueeze(0) == 0., vars.at("scalar_r"),

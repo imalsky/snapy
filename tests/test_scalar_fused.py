@@ -15,6 +15,8 @@ near-cancellation of front-sized terms); with PLM (no WENO5 kernel, every other 
   sphere_cov0_plm  PLM without the covariance row
   box          a Cartesian 3-D box, periodic sides (covariance without a centroid part)
   box_plm      the box with PLM
+  box_dry_plm  the box with PLM and a stage forcing that adds and removes dry mass (both arms of the
+               scalars' dry-source carry)
 The positivity limiter must act (cells with theta < 1) in the PLM cases, the same cells on both paths.
 
   python test_scalar_fused.py
@@ -24,16 +26,32 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+
+from typing import Dict
 
 import numpy as np
 import torch
 import yaml
 
+
+class _DrySource(torch.nn.Module):
+    """Adds 1e-4 of the dry density in even x1 columns and removes it in odd ones."""
+
+    def forward(self, variables: Dict[str, torch.Tensor], dt: float,
+                stage: int) -> Dict[str, torch.Tensor]:
+        rho = variables["hydro_u"][0]
+        i = torch.arange(rho.size(-1), dtype=rho.dtype, device=rho.device)
+        sign = 1.0 - 2.0 * torch.remainder(i, 2.0)
+        du = torch.zeros_like(variables["hydro_u"])
+        du[0] = 1.0e-4 * rho * sign
+        return {"hydro_du": du}
+
 NSTEP, NVAR, TOL, RAD = 4, 6, 1.0e-12, 4
-CASES = ("sphere", "sphere_cov0", "sphere_ub", "sphere_plm", "sphere_cov0_plm", "box", "box_plm")
+CASES = ("sphere", "sphere_cov0", "sphere_ub", "sphere_plm", "sphere_cov0_plm", "box", "box_plm", "box_dry_plm")
 
 
 def config(case):
@@ -118,6 +136,10 @@ def run(case, save):
     dev = torch.device("cuda")
     for b in blocks:
         b.to(dev)
+    if "_dry" in case:
+        path = os.path.join(os.path.dirname(os.path.abspath(save)), f"{case}_dry.pt")
+        torch.jit.script(_DrySource().eval()).save(path)
+        mesh.set_user_stage_forcings([path])
     mu = blocks[0].module("hydro.eos").species_weight()
     mu = float(mu if isinstance(mu, float) else mu[0])
     Rd, T0, g = 8.314462618 / mu, 600.0, 13.5
@@ -233,7 +255,7 @@ def main():
         print(f"{case:16s} fused vs default: hydro_u bitwise {res['0']['hydro_u'] == res['1']['hydro_u']}, "
               f"scalars within {worst:.3g} of the local largest value, positivity-limited cells {h0} / {h1}",
               flush=True)
-    os.rmdir(tmpdir)
+    shutil.rmtree(tmpdir)
     if not limited:
         failures.append("the positivity limiter never acted in a bit-for-bit case, so it was not tested")
     for failure in failures:

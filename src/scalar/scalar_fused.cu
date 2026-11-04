@@ -634,6 +634,61 @@ void scalar_average3_cuda(torch::Tensor& out, torch::Tensor const& u0,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// MeshBlockImpl's carry_dry_source, one thread per (scalar, k, j, i): the
+// stage average, the libtorch where()s and the add, each operation rounded as
+// there. base may alias ds: each thread reads its element before writing it.
+template <typename T>
+__global__ void scalar_carry_dry_kernel(T* ds, T const* __restrict__ s0,
+                                        T const* __restrict__ s, T const* base,
+                                        T const* __restrict__ r,
+                                        T const* __restrict__ rho_base,
+                                        T const* __restrict__ dry, T w0, T w1,
+                                        T w2, int64_t ncell, int64_t total) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  int64_t c = idx % ncell;
+  T sb = radd(radd(rmul(w0, s0[idx]), rmul(w1, s[idx])), rmul(w2, base[idx]));
+  T rb = rho_base[c];
+  T rr = r[idx];
+  T remove = rb == T(0) ? rr : rdiv(sb, rb);
+  T d = dry[c];
+  T carry = d < T(0) ? remove : rr;
+  ds[idx] = radd(ds[idx], rmul(carry, d));
+}
+
+void scalar_carry_dry_cuda(torch::Tensor& ds, torch::Tensor const& s0,
+                           torch::Tensor const& s, torch::Tensor const& base,
+                           torch::Tensor const& r,
+                           torch::Tensor const& rho_base,
+                           torch::Tensor const& dry, double w0, double w1,
+                           double w2) {
+  at::cuda::CUDAGuard device_guard(ds.device());
+  char const* who = "scalar_carry_dry";
+  check_operands(who, ds, {&s0, &s, &base, &r, &rho_base, &dry});
+  TORCH_CHECK(ds.dim() == 4, who, ": ds (nvar, nc3, nc2, nc1) expected");
+  torch::Tensor const& dsc = ds;
+  for (auto const* t : {&dsc, &s0, &s, &base, &r})
+    TORCH_CHECK(t->is_contiguous() && t->sizes() == ds.sizes(), who,
+                ": contiguous ds, s0, s, base, r of one shape expected");
+  for (auto const* t : {&rho_base, &dry})
+    TORCH_CHECK(t->is_contiguous() && t->sizes() == ds.sizes().slice(1), who,
+                ": contiguous rho_base, dry (nc3, nc2, nc1) expected");
+  int64_t total = ds.numel();
+  if (total == 0) return;
+  int threads = 256;
+  int64_t blocks = flat_blocks(total, threads, who);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES(ds.scalar_type(), "scalar_carry_dry_cuda", [&] {
+    scalar_carry_dry_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+        ds.data_ptr<scalar_t>(), s0.data_ptr<scalar_t>(),
+        s.data_ptr<scalar_t>(), base.data_ptr<scalar_t>(),
+        r.data_ptr<scalar_t>(), rho_base.data_ptr<scalar_t>(),
+        dry.data_ptr<scalar_t>(), scalar_t(w0), scalar_t(w1), scalar_t(w2),
+        rho_base.numel(), total);
+  });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 namespace {
 Dims dims_of(torch::Tensor const& u) {
   return Dims{int_extent(u.size(3), "fused scalar"),
@@ -799,6 +854,7 @@ REGISTER_CUDA_DISPATCH(call_scalar_weno5, &snap::scalar_weno5_cuda);
 REGISTER_CUDA_DISPATCH(call_scalar_implicit_transfer,
                        &snap::scalar_implicit_transfer_cuda);
 REGISTER_CUDA_DISPATCH(call_scalar_average3, &snap::scalar_average3_cuda);
+REGISTER_CUDA_DISPATCH(call_scalar_carry_dry, &snap::scalar_carry_dry_cuda);
 REGISTER_CUDA_DISPATCH(call_scalar_theta, &snap::scalar_theta_cuda);
 REGISTER_CUDA_DISPATCH(call_scalar_theta_scale, &snap::scalar_theta_scale_cuda);
 REGISTER_CUDA_DISPATCH(call_scalar_divergence, &snap::scalar_divergence_cuda);

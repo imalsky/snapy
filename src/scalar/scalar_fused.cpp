@@ -57,6 +57,13 @@ void scalar_average3_unsupported(torch::Tensor&, torch::Tensor const&,
                                  double, double, double) {
   TORCH_CHECK(false, "the fused scalar path runs on CUDA devices only");
 }
+void scalar_carry_dry_unsupported(torch::Tensor&, torch::Tensor const&,
+                                  torch::Tensor const&, torch::Tensor const&,
+                                  torch::Tensor const&, torch::Tensor const&,
+                                  torch::Tensor const&, double, double,
+                                  double) {
+  TORCH_CHECK(false, "the fused scalar path runs on CUDA devices only");
+}
 }  // namespace
 
 }  // namespace snap
@@ -80,6 +87,11 @@ DEFINE_DISPATCH(call_scalar_average3);
 REGISTER_ALL_CPU_DISPATCH(call_scalar_average3,
                           &snap::scalar_average3_unsupported);
 REGISTER_MPS_DISPATCH(call_scalar_average3, &snap::scalar_average3_unsupported);
+DEFINE_DISPATCH(call_scalar_carry_dry);
+REGISTER_ALL_CPU_DISPATCH(call_scalar_carry_dry,
+                          &snap::scalar_carry_dry_unsupported);
+REGISTER_MPS_DISPATCH(call_scalar_carry_dry,
+                      &snap::scalar_carry_dry_unsupported);
 DEFINE_DISPATCH(call_scalar_theta);
 REGISTER_ALL_CPU_DISPATCH(call_scalar_theta, &snap::scalar_theta_unsupported);
 REGISTER_MPS_DISPATCH(call_scalar_theta, &snap::scalar_theta_unsupported);
