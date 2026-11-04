@@ -269,6 +269,130 @@ __global__ void scalar_weno5_kernel(T* __restrict__ out,
   }
 }
 
+// Both WENO5 values of one cell (left(): cm, the state at its lower face;
+// right(): cp = cm with its columns reversed, the state at its upper face)
+// from one stencil, with the arithmetic of interp_shared_weno5_coeff_impl.
+// The two share vscale, phi and the smoothness indicators exactly: cp's rows
+// 3, 4 are cm's rows 7, 8 and the reverse, and cp's row 6 is minus cm's row 6,
+// so right()'s beta0, beta1, beta2 are left()'s beta2, beta1, beta0, bit for
+// bit, and the middle weight 0.6 / (beta1 + eps)^2 is the same number.
+#define SQR(x) ((x) * (x))  // as interp_impl.cuh, which undefines it
+template <typename T>
+__device__ __forceinline__ void weno5_pair(T const* src, T const* cm,
+                                           T const* cp, bool scale, T& left,
+                                           T& right) {
+  T vscale = scale ? (fabs(src[0]) + fabs(src[1]) + fabs(src[2]) +
+                      fabs(src[3]) + fabs(src[4])) /
+                         5.0
+                   : 1.0;
+  if (vscale == 0.0) {
+    left = 0.0;
+    right = 0.0;
+    return;
+  }
+  T phi[5];
+  for (int k = 0; k < 5; ++k) {
+    phi[k] = src[k] / vscale;
+  }
+  T beta0 = 13. / 12. * SQR(_vvdot<5>(phi, cm + 15)) +
+            .25 * SQR(_vvdot<5>(phi, cm + 20));
+  T beta1 = 13. / 12. * SQR(_vvdot<5>(phi, cm + 25)) +
+            .25 * SQR(_vvdot<5>(phi, cm + 30));
+  T beta2 = 13. / 12. * SQR(_vvdot<5>(phi, cm + 35)) +
+            .25 * SQR(_vvdot<5>(phi, cm + 40));
+  T d0 = SQR(beta0 + 1e-6), d1 = SQR(beta1 + 1e-6), d2 = SQR(beta2 + 1e-6);
+  T a1 = .6 / d1;
+  {
+    T p0 = _vvdot<5>(phi, cm), p1 = _vvdot<5>(phi, cm + 5),
+      p2 = _vvdot<5>(phi, cm + 10);
+    T a0 = .3 / d0, a2 = .1 / d2;
+    left = vscale * (a0 * p0 + a1 * p1 + a2 * p2) / (a0 + a1 + a2);
+  }
+  {
+    T p0 = _vvdot<5>(phi, cp), p1 = _vvdot<5>(phi, cp + 5),
+      p2 = _vvdot<5>(phi, cp + 10);
+    T a0 = .3 / d2, a2 = .1 / d0;
+    right = vscale * (a0 * p0 + a1 * p1 + a2 * p2) / (a0 + a1 + a2);
+  }
+}
+#undef SQR
+
+// Face states along a line from cell-centred work: the thread of cell p
+// (il - 1 <= p <= iu) evaluates its stencil once and writes the right state
+// of face p (left(), cells il..iu) and the left state of face p + 1 (right(),
+// cells il-1..iu-1), plus the default path's edge copies.
+template <typename T>
+__global__ void scalar_weno5_faces_kernel(T* __restrict__ out,
+                                          T const* __restrict__ w,
+                                          T const* __restrict__ cm,
+                                          T const* __restrict__ cp, bool scale,
+                                          int64_t stride, int n,
+                                          int64_t total) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  int p = static_cast<int>((idx / stride) % n);
+  int il = 3, iu = n - 3;
+  if (p < il - 1 || p > iu) return;
+  int64_t base = idx - static_cast<int64_t>(p) * stride;
+  T src[5];
+#pragma unroll
+  for (int q = 0; q < 5; ++q) {
+    src[q] = w[base + static_cast<int64_t>(p - 2 + q) * stride];
+  }
+  T l, r;
+  weno5_pair(src, cm, cp, scale, l, r);
+  l = clamp0(l);
+  r = clamp0(r);
+  T* ilt = out;
+  T* irt = out + total;
+  if (p >= il) {
+    irt[idx] = l;
+    if (p == il)
+      for (int q = 0; q < il; ++q) irt[base + q * stride] = l;
+    if (p == iu)
+      for (int q = iu + 1; q < n; ++q) irt[base + q * stride] = l;
+  }
+  if (p <= iu - 1) {
+    ilt[idx + stride] = r;
+    if (p == il - 1)
+      for (int q = 0; q < il; ++q) ilt[base + q * stride] = r;
+    if (p == iu - 1)
+      for (int q = iu + 1; q < n; ++q) ilt[base + q * stride] = r;
+  }
+}
+
+// x1 (contiguous) flux: one block per column; each cell's pair goes to shared
+// memory, then each face takes right() of the cell below and left() of the
+// cell above (with the edge copies) for the upwind flux.
+template <typename T>
+__global__ void scalar_weno5_x1_flux_kernel(
+    T* __restrict__ flux, T const* __restrict__ w, T const* __restrict__ cm,
+    T const* __restrict__ cp, bool scale, int n, int64_t ncolumn_cell,
+    T const* __restrict__ vel) {
+  extern __shared__ unsigned char smem_raw[];
+  T* sl = reinterpret_cast<T*>(smem_raw);
+  T* sr = sl + n;
+  int64_t col = blockIdx.x;
+  int64_t base = col * n;
+  int p = threadIdx.x;
+  int il = 3, iu = n - 3;
+  if (p >= il - 1 && p <= iu) {
+    T src[5];
+#pragma unroll
+    for (int q = 0; q < 5; ++q) src[q] = w[base + p - 2 + q];
+    T l, r;
+    weno5_pair(src, cm, cp, scale, l, r);
+    sl[p] = clamp0(l);
+    sr[p] = clamp0(r);
+  }
+  __syncthreads();
+  T wl = sr[min(max(p - 1, il - 1), iu - 1)];
+  T wr = sl[min(max(p, il), iu)];
+  T v = vel[(col % ncolumn_cell) * n + p];
+  T u = v > T(0) ? T(1) : T(0);
+  flux[base + p] = rmul(v, radd(rmul(u, wl), rmul(rsub(T(1), u), wr)));
+}
+
 void scalar_weno5_cuda(torch::Tensor& faces, torch::Tensor const& w,
                        torch::Tensor const& cm, torch::Tensor const& cp,
                        bool scale, int dim, torch::Tensor const& vel) {
@@ -298,16 +422,23 @@ void scalar_weno5_cuda(torch::Tensor& faces, torch::Tensor const& w,
   AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "scalar_weno5_cuda", [&] {
     auto cmp = cm.to(w.scalar_type());
     auto cpp = cp.to(w.scalar_type());
-    if (upwind) {
+    if (upwind && n <= 1024) {
+      int64_t columns = total / n;
+      size_t shared = 2 * static_cast<size_t>(n) * sizeof(scalar_t);
+      scalar_weno5_x1_flux_kernel<scalar_t><<<columns, n, shared, stream>>>(
+          faces.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(),
+          cmp.data_ptr<scalar_t>(), cpp.data_ptr<scalar_t>(), scale, n,
+          ncell / n, vel.data_ptr<scalar_t>());
+    } else if (upwind) {
       scalar_weno5_kernel<scalar_t, true><<<blocks, threads, 0, stream>>>(
           faces.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(),
           cmp.data_ptr<scalar_t>(), cpp.data_ptr<scalar_t>(), scale, stride, n,
           total, ncell, vel.data_ptr<scalar_t>());
     } else {
-      scalar_weno5_kernel<scalar_t, false><<<blocks, threads, 0, stream>>>(
+      scalar_weno5_faces_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
           faces.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(),
           cmp.data_ptr<scalar_t>(), cpp.data_ptr<scalar_t>(), scale, stride, n,
-          total, ncell, nullptr);
+          total);
     }
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
