@@ -301,6 +301,61 @@ torch::Tensor HydroImpl::scalar_flux_covariance(torch::Tensor const& rl,
   return dflx;
 }
 
+std::vector<torch::Tensor> HydroImpl::scalar_flux_covariance_factors(
+    int dim) const {
+  int k = dim == 2 ? 0 : 1;
+  if (!_cov_wl[k].defined()) return {};
+  auto [below, above] = x1_neighbors();
+  TORCH_CHECK(below < 0 && above < 0,
+              "scalar_flux_covariance_factors: no x1 split (seam rows)");
+  auto const& wl = _cov_wl[k];
+  auto const& wr = _cov_wr[k];
+  auto pcoord = pmb->pcoord;
+  int n1 = wl.size(-1);
+  int ny = wl.size(0) - ICY;
+  // every factor below is the expression scalar_flux_covariance uses
+  auto dry_fraction = [&](torch::Tensor const& w) {
+    auto rd = torch::ones_like(w[IDN]);
+    for (int n = 0; n < ny; ++n) rd = rd - w[ICY + n];
+    return rd;
+  };
+  auto wbar = 0.5 * (wl + wr);
+  if (dim == 2) {
+    pcoord->prim2local2_(wbar);
+  } else {
+    pcoord->prim2local3_(wbar);
+  }
+  auto un = wbar[dim == 2 ? IVY : IVZ];
+  auto x1v = pcoord->x1v.to(un.device(), un.scalar_type());
+  auto s2 = pcoord->face_moment2_x1()
+                .to(un.device(), un.scalar_type())
+                .unsqueeze(0)
+                .unsqueeze(1);
+  bool centroid = !pcoord->face_centroid_shift_zero();
+  auto rho = wbar[IDN];
+  auto dx1 = (x1v.narrow(0, 2, n1 - 2) - x1v.narrow(0, 0, n1 - 2));
+  auto cell = [&](torch::Tensor const& a) { return a.narrow(-1, 1, n1 - 2); };
+  auto d1 = [&](torch::Tensor const& a) {
+    return (a.narrow(-1, 2, n1 - 2) - a.narrow(-1, 0, n1 - 2)) / dx1;
+  };
+  auto a = (cell(s2) * cell(rho) * d1(un)).contiguous();
+  torch::Tensor b, nds;
+  if (centroid) {
+    b = (rho * un).contiguous();
+    auto ds = pcoord->face_centroid_shift_x1()
+                  .to(un.device(), un.scalar_type())
+                  .unsqueeze(0)
+                  .unsqueeze(1);
+    nds = (-cell(ds)).reshape({n1 - 2}).contiguous();
+  }
+  return {dry_fraction(wl).contiguous(),
+          dry_fraction(wr).contiguous(),
+          a,
+          b,
+          nds,
+          dx1.contiguous()};
+}
+
 torch::Tensor HydroImpl::forward(double dt, torch::Tensor u,
                                  Variables const& other) {
   enum { DIM1 = 3, DIM2 = 2, DIM3 = 1 };

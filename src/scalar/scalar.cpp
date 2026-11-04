@@ -5,6 +5,9 @@
 #include <snap/hydro/hydro.hpp>
 #include <snap/layout/layout.hpp>
 #include <snap/mesh/meshblock.hpp>
+#include <snap/recon/interpolation.hpp>
+
+#include "scalar_fused.hpp"
 
 namespace snap {
 ScalarImpl::ScalarImpl(const ScalarOptions& options_, torch::nn::Module* p)
@@ -71,10 +74,38 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
   auto rho = other.at("hydro_u")[IDN].unsqueeze(0);
   auto r = u / rho;
 
+  // fused path (SNAP_SCALAR_FUSED=1, CUDA): the same arithmetic in a few
+  // kernels (scalar_fused.cu); WENO5 reconstruction only
+  bool fused = scalar_fused_enabled() && u.is_cuda() &&
+               u.scalar_type() == torch::kFloat64;
+  auto weno5 =
+      fused ? std::dynamic_pointer_cast<Weno5InterpImpl>(precon->pinterp1)
+            : nullptr;
+  auto recon = [&](int dim) {
+    if (!weno5) return precon->forward(r, dim);
+    auto rc = r.contiguous();
+    auto vec = rc.sizes().vec();
+    vec.insert(vec.begin(), 2);
+    auto faces = torch::empty(vec, rc.options());
+    at::native::call_scalar_weno5(faces.device().type(), faces, rc, weno5->cm,
+                                  weno5->cp, weno5->options->scale(), dim,
+                                  torch::Tensor());
+    return faces;
+  };
+
   if (_flux1.defined()) {
-    auto rlr = precon->forward(r, DIM1);
-    _flux1.set_(
-        priemann->forward(rlr[ILT], rlr[IRT], DIM1, pmb->phydro->flux1()[IDN]));
+    if (weno5) {
+      auto rc = r.contiguous();
+      auto flux = torch::empty_like(rc);
+      at::native::call_scalar_weno5(flux.device().type(), flux, rc, weno5->cm,
+                                    weno5->cp, weno5->options->scale(), DIM1,
+                                    pmb->phydro->flux1()[IDN].contiguous());
+      _flux1.set_(flux);
+    } else {
+      auto rlr = precon->forward(r, DIM1);
+      _flux1.set_(priemann->forward(rlr[ILT], rlr[IRT], DIM1,
+                                    pmb->phydro->flux1()[IDN]));
+    }
   }
 
   auto playout = pmb->get_layout();
@@ -85,7 +116,7 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
   std::vector<CommWorkPtr> works2, works3;
 
   if (_flux2.defined()) {
-    rtmp2 = precon->forward(r, DIM2);
+    rtmp2 = recon(DIM2);
     if (playout->options->type() == "cubed-sphere") {
       // Ship the two reconstructed states under DIRECTION-SUFFIXED keys, as the
       // hydro does (hydro_forward.cpp). The ':' suffix selects the directional
@@ -100,7 +131,7 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
   }
 
   if (_flux3.defined()) {
-    rtmp3 = precon->forward(r, DIM3);
+    rtmp3 = recon(DIM3);
     if (playout->options->type() == "cubed-sphere") {
       // See the DIM2 comment above.
       send_vars3["scalar_wl:+"] = rtmp3[ILT];
@@ -132,6 +163,21 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
   bool cov = false;
   auto lateral = [&](torch::Tensor const& rlr, int dim,
                      torch::Tensor const& mass) {
+    if (fused) {
+      // the same flux from one kernel (scalar_fused.cu)
+      auto factors = pmb->phydro->scalar_flux_covariance_factors(dim);
+      cov = cov || !factors.empty();
+      auto vel =
+          factors.empty()
+              ? mass.contiguous()
+              : (mass - pmb->phydro->flux_covariance_dry(dim)).contiguous();
+      auto rl = rlr[ILT].contiguous();
+      auto rr = rlr[IRT].contiguous();
+      auto flux = torch::empty_like(rl);
+      at::native::call_scalar_lateral_flux(flux.device().type(), flux, rl, rr,
+                                           vel, factors);
+      return flux;
+    }
     auto dcov = pmb->phydro->scalar_flux_covariance(rlr[ILT], rlr[IRT], dim);
     if (!dcov.defined())
       return priemann->forward(rlr[ILT], rlr[IRT], dim, mass);
@@ -171,10 +217,38 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
   };
 
   auto cells = pmb->part({0, 0, 0}, PartOptions().exterior(false));
+  // fused path: the face areas and volumes the libtorch path uses, laid out
+  // whole for the kernels
+  at::native::ScalarBox box{pcoord->il(), pcoord->iu(), pcoord->jl(),
+                            pcoord->ju(), pcoord->kl(), pcoord->ku()};
+  torch::Tensor fa1, fa2, fa3, fvol;
+  if (fused) {
+    auto n1 = u.size(3), n2 = u.size(2), n3 = u.size(1);
+    if (_flux1.defined())
+      fa1 = pcoord->face_area1().expand({n3, n2, n1 + 1}).contiguous();
+    if (_flux2.defined())
+      fa2 = pcoord->face_area2().expand({n3, n2 + 1, n1}).contiguous();
+    if (_flux3.defined())
+      fa3 = pcoord->face_area3().expand({n3 + 1, n2, n1}).contiguous();
+    fvol = pcoord->cell_volume().expand({n3, n2, n1}).contiguous();
+  }
   if (pmb->phydro->options->eos()->limiter() || cov) {
-    auto theta = flux_positivity_theta(u, _flux1, _flux2, _flux3, pcoord, dt);
-    _positivity_hits += (theta.index(cells) < 1.).sum();
-    flux_positivity_scale_(sync_theta(theta), _flux1, _flux2, _flux3, pcoord);
+    if (fused) {
+      auto uc = u.contiguous();
+      auto theta = torch::empty_like(uc);
+      double margin = kPositivityRoundoffUlp * machine_epsilon(u.scalar_type());
+      at::native::call_scalar_theta(theta.device().type(), theta, uc, _flux1,
+                                    _flux2, _flux3, fa1, fa2, fa3, fvol, dt,
+                                    1. - margin, box);
+      _positivity_hits += (theta.index(cells) < 1.).sum();
+      at::native::call_scalar_theta_scale(theta.device().type(),
+                                          sync_theta(theta), _flux1, _flux2,
+                                          _flux3, box);
+    } else {
+      auto theta = flux_positivity_theta(u, _flux1, _flux2, _flux3, pcoord, dt);
+      _positivity_hits += (theta.index(cells) < 1.).sum();
+      flux_positivity_scale_(sync_theta(theta), _flux1, _flux2, _flux3, pcoord);
+    }
   }
 
   // r <= b is positivity of the complement b*rho - s, whose flux is b*F_mass -
@@ -215,6 +289,15 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
     if (_flux3.defined()) _flux3.add_(h3 - g3);
   }
 
+  if (fused) {
+    auto div = torch::empty_like(u, at::MemoryFormat::Contiguous);
+    auto ds = torch::empty_like(div);
+    at::native::call_scalar_divergence(div.device().type(), div, ds, _flux1,
+                                       _flux2, _flux3, fa1, fa2, fa3, fvol, dt,
+                                       box);
+    _div.set_(div);
+    return ds;
+  }
   _div.set_(pcoord->divergence(_flux1, _flux2, _flux3));
   auto ds = torch::zeros_like(_div);
   auto interior = pmb->part({0, 0, 0}, PartOptions().exterior(false));

@@ -14,6 +14,7 @@
 #include <snap/hydro/gravity_work_radial.hpp>
 #include <snap/input/read_restart_file.hpp>
 #include <snap/output/output_formats.hpp>
+#include <snap/scalar/scalar_fused.hpp>
 #include <snap/utils/log.hpp>
 #include <snap/utils/signal_handler.hpp>
 
@@ -696,12 +697,21 @@ void MeshBlockImpl::advance_local(Variables &vars, double dt, int stage) {
       auto M = mass_corr[IVY];  // slot IVX+(dir+1)%3 with dir == 0 (x1 only)
       auto r = vars.at("scalar_r");
       int nc1 = r.size(-1);
-      auto r_below = torch::zeros_like(r);
-      r_below.slice(-1, 1, nc1) = r.slice(-1, 0, nc1 - 1);
-      auto P = torch::where(M > 0., r_below, r) * M;
-      auto P_above = torch::zeros_like(P);
-      P_above.slice(-1, 0, nc1 - 1) = P.slice(-1, 1, nc1);
-      fut_scalar_ds.add_((P - P_above) / pcoord->cell_volume());
+      if (scalar_fused_enabled() && r.is_cuda() &&
+          r.scalar_type() == torch::kFloat64 && fut_scalar_ds.is_contiguous()) {
+        // the same transfer in one kernel (scalar_fused.cu)
+        auto vol = pcoord->cell_volume().expand(M.sizes()).contiguous();
+        at::native::call_scalar_implicit_transfer(fut_scalar_ds.device().type(),
+                                                  fut_scalar_ds, r.contiguous(),
+                                                  M.contiguous(), vol);
+      } else {
+        auto r_below = torch::zeros_like(r);
+        r_below.slice(-1, 1, nc1) = r.slice(-1, 0, nc1 - 1);
+        auto P = torch::where(M > 0., r_below, r) * M;
+        auto P_above = torch::zeros_like(P);
+        P_above.slice(-1, 0, nc1 - 1) = P.slice(-1, 1, nc1);
+        fut_scalar_ds.add_((P - P_above) / pcoord->cell_volume());
+      }
     }
     // Native dry sources follow transport and the implicit tracer transfer.
     carry_dry_source(phydro->forcing_dry_increment(), fut_scalar_ds);
@@ -817,7 +827,19 @@ void MeshBlockImpl::advance_local(Variables &vars, double dt, int stage) {
   }
 
   if (pscalar->nvar() > 0) {
-    scalar_s.set_(pintg->forward(stage, _scalar_s0, scalar_s, fut_scalar_ds));
+    if (scalar_fused_enabled() && scalar_s.is_cuda() &&
+        scalar_s.scalar_type() == torch::kFloat64 &&
+        _scalar_s0.is_contiguous() && scalar_s.is_contiguous() &&
+        fut_scalar_ds.is_contiguous()) {
+      auto const &w = pintg->stages[stage];
+      auto avg = torch::empty_like(scalar_s);
+      at::native::call_scalar_average3(avg.device().type(), avg, _scalar_s0,
+                                       scalar_s, fut_scalar_ds, w.wght0(),
+                                       w.wght1(), w.wght2());
+      scalar_s.set_(avg);
+    } else {
+      scalar_s.set_(pintg->forward(stage, _scalar_s0, scalar_s, fut_scalar_ds));
+    }
     set_scalar_primitive(vars, scalar_s, hydro_u);
     if (options->verbose()) {
       auto end = std::chrono::high_resolution_clock::now();

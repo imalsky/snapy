@@ -148,6 +148,14 @@ class HydroImpl : public torch::nn::Cloneable<HydroImpl> {
    */
   torch::Tensor scalar_flux_covariance(torch::Tensor const& rl,
                                        torch::Tensor const& rr, int dim) const;
+  //! the tracer-independent factors of scalar_flux_covariance on the x2 (dim
+  //! 2) or x3 (dim 1) faces, computed by the same expressions, for a kernel
+  //! that forms the per-tracer part: rdl, rdr (dry fractions of the face
+  //! states), a = cell(s2) cell(rho) d1(u_n) (nc3, nc2, n1 - 2), b = rho u_n,
+  //! nds = -cell(ds) (n1 - 2; undefined without a centroid shift), dx1
+  //! (n1 - 2). Empty when the faces carried no covariance. Refused across an
+  //! x1 split, whose seam rows the kernel does not take.
+  std::vector<torch::Tensor> scalar_flux_covariance_factors(int dim) const;
   //! the dry-mass row of this stage's covariance increment on the x2 (dim 2)
   //! or x3 (dim 1) faces, which flux2()/flux3()[IDN] carry; undefined when
   //! those faces carried none
