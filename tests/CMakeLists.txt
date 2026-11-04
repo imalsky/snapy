@@ -424,6 +424,13 @@ if(CUDA)
   # bit for bit, the WENO5 cases to round-off
   snapy_add_python_test(test_scalar_fused
     TIMEOUT 600 LABELS "python;scalar;cuda")
+  # the fused path on a column split in x1, with the covariance (its lateral
+  # flux keeps the default path there)
+  snapy_add_python_test(test_scalar_cov_x1_split_fused_cuda
+    SCRIPT test_scalar_cov_x1_split.py ARGS --device cuda
+    TIMEOUT 300 LABELS "python;hydro;scalar;cuda")
+  set_tests_properties(test_scalar_cov_x1_split_fused_cuda_python PROPERTIES
+                       ENVIRONMENT "SNAP_FLUX_COVARIANCE=1;SNAP_SCALAR_FUSED=1")
   set_tests_properties(
     test_fix_vapor_reports_failure_cuda_python
     test_fix_vapor_stale_count_cuda_python
@@ -436,6 +443,7 @@ if(CUDA)
     test_gravity_work_radial_exact_cuda_python
     test_scalar_flux_covariance_cuda_python
     test_scalar_fused_python
+    test_scalar_cov_x1_split_fused_cuda_python
     PROPERTIES SKIP_RETURN_CODE 125)
 endif()
 

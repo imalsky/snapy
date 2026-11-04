@@ -2,7 +2,8 @@
 // divisions than the default arithmetic, against the default reconstruction
 // of a scalar (Reconstruct without a hydro: WENO5, edge copies, clamp at 0) on
 // lines that stress that arithmetic: values over many decades, constants down
-// to the subnormals, zero, fronts of large contrast, a huge spike, nearly
+// to the subnormals and up to 1e300, zero, fronts of large contrast, a huge
+// spike, nearly
 // constant lines (smoothness indicators near the 1e-6 epsilon), oscillation,
 // negative values, NaN and Inf. Along x1, x2 and x3, as face states and as the
 // x1 upwind flux, on lines up to 1024 cells and longer (the long x1 flux keeps
@@ -10,7 +11,8 @@
 // subnormal values. Each finite value must agree to round-off relative to the
 // largest finite input within 4 cells along the line (so a low plateau beside
 // a front is judged on its own scale), and NaN and Inf must appear where the
-// default has them.
+// default has them, except on the 1e300 plateau, where the default formula
+// overflows and the kernel must return the plateau.
 
 #include <gtest/gtest.h>
 #include <torch/torch.h>
@@ -29,7 +31,8 @@ using namespace snap;
 
 namespace {
 
-constexpr int NVAR = 16;
+constexpr int NVAR = 17;
+constexpr int HUGE_VAR = 16;  // a constant 1e300 plateau
 
 torch::Tensor make_lines(int n, int dim) {
   auto opts = torch::TensorOptions().dtype(torch::kFloat64);
@@ -60,6 +63,7 @@ torch::Tensor make_lines(int n, int dim) {
       x == 3., std::numeric_limits<double>::quiet_NaN() * one,
       torch::where(x == n - 5., std::numeric_limits<double>::infinity() * one,
                    one));
+  w[HUGE_VAR] = 1e300 * one;
   return w;
 }
 
@@ -77,15 +81,17 @@ torch::Tensor local_max(torch::Tensor w, int dim, int r) {
   return out;
 }
 
-// b against the reference a, variable by variable: |b - a| <= tol * scale
+// b against the reference a, variable by variable: |b - a| <= tol * scale;
+// variable `skip` is not compared
 void expect_close(torch::Tensor a, torch::Tensor b, torch::Tensor scale,
-                  double tol, std::string const& what) {
+                  double tol, std::string const& what, int skip = -1) {
   a = a.cpu().to(torch::kFloat64);
   b = b.cpu().to(torch::kFloat64);
   scale = scale.cpu().to(torch::kFloat64).expand_as(a);
   ASSERT_EQ(a.sizes(), b.sizes()) << what;
   int vdim = a.dim() == 5 ? 1 : 0;
   for (int v = 0; v < NVAR; ++v) {
+    if (v == skip) continue;
     auto av = a.select(vdim, v), bv = b.select(vdim, v),
          sv = scale.select(vdim, v);
     EXPECT_TRUE(torch::equal(torch::isnan(av), torch::isnan(bv)))
@@ -113,7 +119,16 @@ void check(Reconstruct rec, torch::Tensor w, int dim, bool scale, double tol,
   auto faces = torch::empty_like(ref);
   at::native::call_scalar_weno5(dev.type(), faces, w, weno5->cm, weno5->cp,
                                 scale, dim, torch::Tensor());
-  expect_close(ref, faces, lmax.unsqueeze(0), tol, tag + " faces");
+  // with scaling the default formula overflows on the 1e300 plateau (the
+  // scale times the unnormalised weighted sum); the kernel forms the quotient
+  // first, so its faces must be the plateau itself
+  int skip = scale && w.scalar_type() == torch::kFloat64 ? HUGE_VAR : -1;
+  expect_close(ref, faces, lmax.unsqueeze(0), tol, tag + " faces", skip);
+  if (skip >= 0) {
+    auto huge = faces.select(1, HUGE_VAR).cpu();
+    EXPECT_TRUE(torch::isfinite(huge).all().item<bool>()) << tag;
+    EXPECT_LE(((huge - 1e300).abs() / 1e300).max().item<double>(), tol) << tag;
+  }
   if (dim == 3) {
     auto vel = torch::sin(
         torch::arange(w[0].numel(), w.options()).view(w[0].sizes()) * 0.7);
@@ -122,8 +137,15 @@ void check(Reconstruct rec, torch::Tensor w, int dim, bool scale, double tol,
     auto flux = torch::empty_like(w);
     at::native::call_scalar_weno5(dev.type(), flux, w, weno5->cm, weno5->cp,
                                   scale, dim, vel.contiguous());
+    // x1 columns longer than 1024 cells keep the default arithmetic
+    int skip_flux = w.size(3) <= 1024 ? skip : -1;
     expect_close(flux_ref, flux, lmax * vel.abs().unsqueeze(0), tol,
-                 tag + " upwind flux");
+                 tag + " upwind flux", skip_flux);
+    if (skip_flux >= 0) {
+      auto want = (vel * 1e300).cpu();
+      auto got = flux.select(0, HUGE_VAR).cpu();
+      EXPECT_LE(((got - want).abs() / 1e300).max().item<double>(), tol) << tag;
+    }
   }
 }
 

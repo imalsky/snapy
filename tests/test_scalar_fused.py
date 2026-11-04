@@ -12,7 +12,10 @@ near-cancellation of front-sized terms); with PLM (no WENO5 kernel, every other 
   sphere_cov0  the same with SNAP_FLUX_COVARIANCE=0 (no covariance row)
   sphere_ub    the same with an upper bound on the tracers (its second limiter stays in libtorch)
   sphere_plm   PLM tracer reconstruction (the WENO5 kernel is not used; the other kernels are)
+  sphere_cov0_plm  PLM without the covariance row
   box          a Cartesian 3-D box, periodic sides (covariance without a centroid part)
+  box_plm      the box with PLM
+The positivity limiter must act (cells with theta < 1) in the PLM cases, the same cells on both paths.
 
   python test_scalar_fused.py
 """
@@ -30,7 +33,7 @@ import torch
 import yaml
 
 NSTEP, NVAR, TOL, RAD = 4, 6, 1.0e-12, 4
-CASES = ("sphere", "sphere_cov0", "sphere_ub", "sphere_plm", "box")
+CASES = ("sphere", "sphere_cov0", "sphere_ub", "sphere_plm", "sphere_cov0_plm", "box", "box_plm")
 
 
 def config(case):
@@ -70,7 +73,7 @@ def config(case):
         cfg["forcing"]["coriolis"] = {"type": "xyz", "omega1": 2.2e-6}
     if case == "sphere_ub":
         cfg["scalar"]["upper-bound"] = 1.0
-    if case == "sphere_plm":
+    if case.endswith("_plm"):
         cfg["scalar"]["reconstruct"] = {"type": "plm", "scale": False, "shock": True}
     return cfg
 
@@ -161,7 +164,8 @@ def run(case, save):
         err = mesh.check_redo(variables)
         assert err == 0, f"redo request {err}"
     np.save(save, torch.stack([v["scalar_s"] for v in variables]).cpu().numpy())
-    return {"case": case, "fused": os.environ.get("SNAP_SCALAR_FUSED", "0"),
+    hits = sum(int(dict(b.named_buffers())["scalar.positivity_hits"].sum()) for b in blocks)
+    return {"case": case, "fused": os.environ.get("SNAP_SCALAR_FUSED", "0"), "positivity_hits": hits,
             "hydro_u": [digest(v["hydro_u"]) for v in variables],
             "finite": bool(all(torch.isfinite(v["scalar_s"]).all() for v in variables))}
 
@@ -179,13 +183,14 @@ def main():
         print(json.dumps(run(a.child, a.save)), flush=True)
         return
     failures = []
+    limited = 0  # positivity-limited cells in the bit-for-bit cases
     tmpdir = tempfile.mkdtemp(dir=os.getcwd())
     for case in CASES:
         res, arr = {}, {}
         for fused in ("0", "1"):
             env = dict(os.environ)
             env["SNAP_SCALAR_FUSED"] = fused
-            if case == "sphere_cov0":
+            if case.startswith("sphere_cov0"):
                 env["SNAP_FLUX_COVARIANCE"] = "0"
             else:
                 env.pop("SNAP_FLUX_COVARIANCE", None)
@@ -207,11 +212,16 @@ def main():
         if not (res["0"]["finite"] and res["1"]["finite"]):
             failures.append(f"{case}: non-finite tracers")
         a0, a1 = arr["0"], arr["1"]
-        if case == "sphere_plm":
+        h0, h1 = res["0"]["positivity_hits"], res["1"]["positivity_hits"]
+        if case.endswith("_plm"):
             same = a0.shape == a1.shape and np.array_equal(a0.view(np.uint64), a1.view(np.uint64))
-            print(f"{case:12s} fused vs default: {'bitwise identical' if same else 'DIFFERENT'}", flush=True)
+            print(f"{case:16s} fused vs default: {'bitwise identical' if same else 'DIFFERENT'}, "
+                  f"positivity-limited cells {h0} / {h1}", flush=True)
             if not same:
                 failures.append(f"{case}: fused and default paths differ")
+            if h0 != h1:
+                failures.append(f"{case}: positivity-limited cells differ ({h0} / {h1})")
+            limited += h1
             continue
         worst = 0.0
         for k in range(NVAR):
@@ -220,9 +230,12 @@ def main():
             if not err <= TOL:
                 failures.append(f"{case}: tracer {k} differs by {err:.3g} of the local largest value (> {TOL})")
             worst = max(worst, err) if err == err else float("nan")
-        print(f"{case:12s} fused vs default: hydro_u bitwise {res['0']['hydro_u'] == res['1']['hydro_u']}, "
-              f"scalars within {worst:.3g} of the local largest value", flush=True)
+        print(f"{case:16s} fused vs default: hydro_u bitwise {res['0']['hydro_u'] == res['1']['hydro_u']}, "
+              f"scalars within {worst:.3g} of the local largest value, positivity-limited cells {h0} / {h1}",
+              flush=True)
     os.rmdir(tmpdir)
+    if not limited:
+        failures.append("the positivity limiter never acted in a bit-for-bit case, so it was not tested")
     for failure in failures:
         print("FAIL", failure)
     sys.exit(bool(failures))

@@ -74,9 +74,9 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
   auto rho = other.at("hydro_u")[IDN].unsqueeze(0);
   auto r = u / rho;
 
-  // fused path (SNAP_SCALAR_FUSED=1, CUDA): the same arithmetic in a few
-  // kernels (scalar_fused.cu), except WENO5's weights, which take fewer
-  // divisions (round-off differences); WENO5 reconstruction only
+  // fused path (SNAP_SCALAR_FUSED=1, CUDA, float64): the same arithmetic in a
+  // few kernels (scalar_fused.cu); the reconstruction is fused only for
+  // WENO5, whose weights take fewer divisions (round-off differences)
   bool fused = scalar_fused_enabled() && u.is_cuda() &&
                u.scalar_type() == torch::kFloat64;
   auto weno5 =
@@ -162,9 +162,15 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
   // without that row and adds its own: the flux of a hydro species with the
   // same mass fraction
   bool cov = false;
+  // the fused kernel takes the covariance factors of a column that is not
+  // split in x1 (HydroImpl::scalar_flux_covariance_factors); with a split
+  // the covariance takes the default path, which reads the seam rows
+  auto [x1_below, x1_above] = pmb->phydro->x1_neighbors();
+  bool x1_whole = x1_below < 0 && x1_above < 0;
   auto lateral = [&](torch::Tensor const& rlr, int dim,
                      torch::Tensor const& mass) {
-    if (fused) {
+    if (fused &&
+        (x1_whole || !pmb->phydro->flux_covariance_dry(dim).defined())) {
       // the same flux from one kernel (scalar_fused.cu)
       auto factors = pmb->phydro->scalar_flux_covariance_factors(dim);
       cov = cov || !factors.empty();

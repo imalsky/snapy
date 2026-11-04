@@ -10,7 +10,8 @@
 // expressions it replaces, with every product, sum and quotient rounded
 // separately (no contraction), so it reproduces the default path bit for bit;
 // the one exception is the WENO5 reconstruction (call_scalar_weno5), whose
-// weights take fewer divisions and so differ at round-off.
+// weights take fewer divisions and so differ at round-off (and which stays
+// finite on values above about 1e290, where the default formula overflows).
 
 namespace snap {
 //! true when SNAP_SCALAR_FUSED=1 (read once)

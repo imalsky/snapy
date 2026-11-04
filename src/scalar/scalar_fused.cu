@@ -1,5 +1,8 @@
 // C/C++
+#include <initializer_list>
 #include <limits>
+#include <utility>
+#include <vector>
 
 // torch
 #include <ATen/Dispatch.h>
@@ -13,6 +16,33 @@
 #include <snap/recon/interp_impl.cuh>
 
 namespace snap {
+
+namespace {
+// every defined tensor on ref's CUDA device with ref's dtype
+void check_operands(char const* who, torch::Tensor const& ref,
+                    std::initializer_list<torch::Tensor const*> ts) {
+  TORCH_CHECK(ref.is_cuda(), who, ": CUDA tensors expected");
+  for (auto const* t : ts) {
+    if (!t->defined()) continue;
+    TORCH_CHECK(
+        t->device() == ref.device() && t->scalar_type() == ref.scalar_type(),
+        who, ": every tensor on ", ref.device(), " as ", ref.scalar_type());
+  }
+}
+// an extent the kernels hold in an int
+int int_extent(int64_t n, char const* who) {
+  TORCH_CHECK(n >= 0 && n <= std::numeric_limits<int>::max(), who, ": extent ",
+              n, " does not fit an int");
+  return static_cast<int>(n);
+}
+// blocks of a launch of one thread per element
+int64_t flat_blocks(int64_t total, int threads, char const* who) {
+  int64_t blocks = (total + threads - 1) / threads;
+  TORCH_CHECK(blocks <= std::numeric_limits<int>::max(), who,
+              ": too many elements for one grid");
+  return blocks;
+}
+}  // namespace
 
 // Separately rounded arithmetic: the libtorch chains this path replaces round
 // after every operation, so no product may be contracted into a sum here.
@@ -96,20 +126,47 @@ void scalar_lateral_flux_cuda(torch::Tensor& flux, torch::Tensor const& rl,
                               torch::Tensor const& rr, torch::Tensor const& vel,
                               std::vector<torch::Tensor> const& factors) {
   at::cuda::CUDAGuard device_guard(rl.device());
+  char const* who = "scalar_lateral_flux";
+  check_operands(who, rl, {&rr, &flux, &vel});
   TORCH_CHECK(rl.is_contiguous() && rr.is_contiguous() &&
                   flux.is_contiguous() && vel.is_contiguous(),
-              "scalar_lateral_flux: contiguous tensors expected");
-  TORCH_CHECK(
-      rl.dim() == 4 && vel.dim() == 3 && vel.numel() * rl.size(0) == rl.numel(),
-      "scalar_lateral_flux: shapes (nvar, nc3, nc2, nc1) and "
-      "(nc3, nc2, nc1) expected");
+              who, ": contiguous tensors expected");
+  TORCH_CHECK(rl.dim() == 4 && rr.sizes() == rl.sizes() &&
+                  flux.sizes() == rl.sizes() &&
+                  vel.sizes() == rl.sizes().slice(1),
+              who, ": rl, rr, flux (nvar, nc3, nc2, nc1), vel (nc3, nc2, nc1)");
   bool cov = !factors.empty();
-  bool centroid = cov && factors[3].defined();
+  // rdl, rdr, a, b, nds, dx1 (HydroImpl::scalar_flux_covariance_factors)
+  bool centroid = cov && factors.size() == 6 && factors[3].defined();
+  int64_t n3 = rl.size(1), n2 = rl.size(2), n1l = rl.size(3);
+  if (cov) {
+    TORCH_CHECK(factors.size() == 6 && n1l >= 3, who,
+                ": six covariance factors and at least 3 x1 cells expected");
+    TORCH_CHECK(factors[3].defined() == factors[4].defined(), who,
+                ": b and nds come together (the centroid shift)");
+    auto shaped = [&](int k, std::vector<int64_t> shape) {
+      auto const& t = factors[k];
+      TORCH_CHECK(t.defined() && t.is_contiguous() &&
+                      t.sizes() == torch::IntArrayRef(shape),
+                  who, ": covariance factor ", k, " shaped ", shape,
+                  " expected");
+      check_operands(who, rl, {&t});
+    };
+    shaped(0, {n3, n2, n1l});
+    shaped(1, {n3, n2, n1l});
+    shaped(2, {n3, n2, n1l - 2});
+    shaped(5, {n1l - 2});
+    if (centroid) {
+      shaped(3, {n3, n2, n1l});
+      shaped(4, {n1l - 2});
+    }
+  }
   int64_t total = rl.numel();
+  if (total == 0) return;
   int64_t ncell = vel.numel();
-  int n1 = static_cast<int>(rl.size(3));
+  int n1 = int_extent(n1l, who);
   int threads = 256;
-  int64_t blocks = (total + threads - 1) / threads;
+  int64_t blocks = flat_blocks(total, threads, who);
   auto stream = at::cuda::getCurrentCUDAStream();
 
   AT_DISPATCH_FLOATING_TYPES(rl.scalar_type(), "scalar_lateral_flux_cuda", [&] {
@@ -234,20 +291,19 @@ __global__ void scalar_divergence_kernel(
   ds[idx] = interior ? rmul(q, mdt) : T(0);
 }
 
-// One thread per face element (scalar, k, j, i). Along the reconstruction
-// dimension (size n, element stride s, ghosts il = 3, iu = n - 3) the default
-// path stores right() of cell p - 1 as the left state of face p and left() of
-// cell p as its right state, for faces il..iu+1 and il-1..iu, then copies the
-// edge values outward: the cells used are clamp(p - 1, il - 1, iu - 1) and
-// clamp(p, il, iu). Used only for the x1 upwind flux of columns longer than
-// 1024 cells, with the default path's arithmetic (bit for bit).
-template <typename T, bool UPWIND>
-__global__ void scalar_weno5_kernel(T* __restrict__ out,
-                                    T const* __restrict__ w,
-                                    T const* __restrict__ cm,
-                                    T const* __restrict__ cp, bool scale,
-                                    int64_t stride, int n, int64_t total,
-                                    int64_t ncell, T const* __restrict__ vel) {
+// The x1 upwind flux of columns longer than 1024 cells (too long for one
+// block of scalar_weno5_x1_flux_kernel), one thread per face element (scalar,
+// k, j, i), with the default path's arithmetic (bit for bit). Along x1 (size
+// n, element stride s, ghosts il = 3, iu = n - 3) the default path stores
+// right() of cell p - 1 as the left state of face p and left() of cell p as
+// its right state, for faces il..iu+1 and il-1..iu, then copies the edge
+// values outward: the cells used are clamp(p - 1, il - 1, iu - 1) and
+// clamp(p, il, iu).
+template <typename T>
+__global__ void scalar_weno5_long_flux_kernel(
+    T* __restrict__ out, T const* __restrict__ w, T const* __restrict__ cm,
+    T const* __restrict__ cp, bool scale, int64_t stride, int n, int64_t total,
+    int64_t ncell, T const* __restrict__ vel) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= total) return;
   int p = static_cast<int>((idx / stride) % n);
@@ -263,14 +319,9 @@ __global__ void scalar_weno5_kernel(T* __restrict__ out,
   }
   T wl = clamp0(interp_shared_weno5_coeff_impl(sl, cp, 0, 0, 5, scale));
   T wr = clamp0(interp_shared_weno5_coeff_impl(sr, cm, 0, 0, 5, scale));
-  if (UPWIND) {
-    T v = vel[idx % ncell];
-    T u = v > T(0) ? T(1) : T(0);
-    out[idx] = rmul(v, radd(rmul(u, wl), rmul(rsub(T(1), u), wr)));
-  } else {
-    out[idx] = wl;          // ILT
-    out[total + idx] = wr;  // IRT
-  }
+  T v = vel[idx % ncell];
+  T u = v > T(0) ? T(1) : T(0);
+  out[idx] = rmul(v, radd(rmul(u, wl), rmul(rsub(T(1), u), wr)));
 }
 
 // Both WENO5 values of one cell (left(): cm, the state at its lower face;
@@ -285,8 +336,9 @@ __global__ void scalar_weno5_kernel(T* __restrict__ out,
 //   they are multiplied through by d0 d1 d2 (with |phi| summing to 5, every
 //   d_j d_k lies in [1e-24, 2e9]); one reciprocal of the two weight sums
 //   serves both faces (fp64), and the quotient is formed before the scale is
-//   applied, so tiny and huge values stay in range. Divisions by variables
-//   go from 12 to 2 (besides the mean's / 5).
+//   applied, so tiny and huge values stay in range (the default formula
+//   overflows to Inf on stencils above about 1e290; this one does not).
+//   Divisions by variables go from 12 to 2 (besides the mean's / 5).
 // - Without scaling (scale false) the products are not bounded: the default
 //   formula is used.
 #define SQR(x) ((x) * (x))  // as interp_impl.cuh, which undefines it
@@ -437,27 +489,38 @@ void scalar_weno5_cuda(torch::Tensor& faces, torch::Tensor const& w,
                        torch::Tensor const& cm, torch::Tensor const& cp,
                        bool scale, int dim, torch::Tensor const& vel) {
   at::cuda::CUDAGuard device_guard(w.device());
-  TORCH_CHECK(w.dim() == 4 && w.is_contiguous() && faces.is_contiguous(),
-              "scalar_weno5: contiguous (nvar, nc3, nc2, nc1) expected");
-  TORCH_CHECK(dim >= 1 && dim <= 3, "scalar_weno5: dim 1, 2 or 3");
+  char const* who = "scalar_weno5";
+  check_operands(who, w, {&faces, &vel});
+  TORCH_CHECK(w.dim() == 4 && w.is_contiguous() && faces.is_contiguous(), who,
+              ": contiguous (nvar, nc3, nc2, nc1) expected");
+  TORCH_CHECK(dim >= 1 && dim <= 3, who, ": dim 1, 2 or 3");
   TORCH_CHECK(cm.numel() == 45 && cp.numel() == 45 && cm.is_contiguous() &&
-                  cp.is_contiguous(),
-              "scalar_weno5: 45 contiguous WENO5 coefficients expected");
-  int n = static_cast<int>(w.size(dim));
-  TORCH_CHECK(n >= 6, "scalar_weno5: at least 6 cells along the line");
+                  cp.is_contiguous() && cm.device() == w.device() &&
+                  cp.device() == w.device(),
+              who, ": 45 contiguous WENO5 coefficients on ", w.device(),
+              " expected");
+  TORCH_CHECK(w.size(dim) >= 6, who, ": at least 6 cells along the line");
+  int n = int_extent(w.size(dim), who);
   int64_t stride = w.stride(dim);
   int64_t total = w.numel();
-  int64_t ncell = total / w.size(0);
   bool upwind = vel.defined();
   if (upwind) {
-    TORCH_CHECK(dim == 3 && vel.is_contiguous() && vel.numel() == ncell &&
+    TORCH_CHECK(dim == 3 && vel.is_contiguous() &&
+                    vel.sizes() == w.sizes().slice(1) &&
                     faces.sizes() == w.sizes(),
-                "scalar_weno5: the upwind form is x1 only");
+                who,
+                ": the upwind form is x1 only, vel (nc3, nc2, nc1) and the "
+                "flux shaped like w");
   } else {
-    TORCH_CHECK(faces.numel() == 2 * total, "scalar_weno5: (2, ...) faces");
+    std::vector<int64_t> two = {2};
+    two.insert(two.end(), w.sizes().begin(), w.sizes().end());
+    TORCH_CHECK(faces.sizes() == torch::IntArrayRef(two), who,
+                ": faces (2, nvar, nc3, nc2, nc1) expected");
   }
+  if (total == 0) return;
+  int64_t ncell = total / w.size(0);
   int threads = 256;
-  int64_t blocks = (total + threads - 1) / threads;
+  int64_t blocks = flat_blocks(total, threads, who);
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "scalar_weno5_cuda", [&] {
     auto cmp = cm.to(w.scalar_type());
@@ -472,7 +535,7 @@ void scalar_weno5_cuda(torch::Tensor& faces, torch::Tensor const& w,
           cmp.data_ptr<scalar_t>(), cpp.data_ptr<scalar_t>(), scale, n,
           ncell / n, vel.data_ptr<scalar_t>());
     } else if (upwind) {
-      scalar_weno5_kernel<scalar_t, true><<<blocks, threads, 0, stream>>>(
+      scalar_weno5_long_flux_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
           faces.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(),
           cmp.data_ptr<scalar_t>(), cpp.data_ptr<scalar_t>(), scale, stride, n,
           total, ncell, vel.data_ptr<scalar_t>());
@@ -521,23 +584,28 @@ void scalar_implicit_transfer_cuda(torch::Tensor& ds, torch::Tensor const& r,
                                    torch::Tensor const& m,
                                    torch::Tensor const& vol) {
   at::cuda::CUDAGuard device_guard(ds.device());
+  char const* who = "scalar_implicit_transfer";
+  check_operands(who, ds, {&r, &m, &vol});
   TORCH_CHECK(ds.is_contiguous() && r.is_contiguous() && m.is_contiguous() &&
-                  vol.is_contiguous() && ds.sizes() == r.sizes() &&
-                  m.numel() * r.size(0) == r.numel() &&
-                  vol.numel() == m.numel(),
-              "scalar_implicit_transfer: contiguous (nvar, nc3, nc2, nc1) and "
-              "(nc3, nc2, nc1) expected");
+                  vol.is_contiguous() && r.dim() == 4 &&
+                  ds.sizes() == r.sizes() && m.sizes() == r.sizes().slice(1) &&
+                  vol.sizes() == m.sizes(),
+              who,
+              ": contiguous ds, r (nvar, nc3, nc2, nc1) and M, vol (nc3, nc2, "
+              "nc1) expected");
   int64_t total = r.numel();
+  if (total == 0) return;
+  int n1 = int_extent(r.size(3), who);
   int threads = 256;
-  int64_t blocks = (total + threads - 1) / threads;
+  int64_t blocks = flat_blocks(total, threads, who);
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES(
       r.scalar_type(), "scalar_implicit_transfer_cuda", [&] {
         scalar_implicit_transfer_kernel<scalar_t>
             <<<blocks, threads, 0, stream>>>(
                 ds.data_ptr<scalar_t>(), r.data_ptr<scalar_t>(),
-                m.data_ptr<scalar_t>(), vol.data_ptr<scalar_t>(),
-                static_cast<int>(r.size(3)), m.numel(), total);
+                m.data_ptr<scalar_t>(), vol.data_ptr<scalar_t>(), n1, m.numel(),
+                total);
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -546,13 +614,16 @@ void scalar_average3_cuda(torch::Tensor& out, torch::Tensor const& u0,
                           torch::Tensor const& u1, torch::Tensor const& u2,
                           double w0, double w1, double w2) {
   at::cuda::CUDAGuard device_guard(out.device());
+  char const* who = "scalar_average3";
+  check_operands(who, out, {&u0, &u1, &u2});
   TORCH_CHECK(out.is_contiguous() && u0.is_contiguous() && u1.is_contiguous() &&
                   u2.is_contiguous() && u0.sizes() == out.sizes() &&
                   u1.sizes() == out.sizes() && u2.sizes() == out.sizes(),
-              "scalar_average3: contiguous tensors of one shape expected");
+              who, ": contiguous tensors of one shape expected");
   int64_t total = out.numel();
+  if (total == 0) return;
   int threads = 256;
-  int64_t blocks = (total + threads - 1) / threads;
+  int64_t blocks = flat_blocks(total, threads, who);
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES(out.scalar_type(), "scalar_average3_cuda", [&] {
     scalar_average3_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
@@ -565,12 +636,14 @@ void scalar_average3_cuda(torch::Tensor& out, torch::Tensor const& u0,
 
 namespace {
 Dims dims_of(torch::Tensor const& u) {
-  return Dims{static_cast<int>(u.size(3)), static_cast<int>(u.size(2)),
-              static_cast<int>(u.size(1))};
+  return Dims{int_extent(u.size(3), "fused scalar"),
+              int_extent(u.size(2), "fused scalar"),
+              int_extent(u.size(1), "fused scalar")};
 }
 void check_fused_shapes(torch::Tensor const& u, torch::Tensor const& a1,
                         torch::Tensor const& a2, torch::Tensor const& a3,
                         torch::Tensor const& vol) {
+  TORCH_CHECK(u.dim() == 4, "fused scalar: (nvar, nc3, nc2, nc1) expected");
   int64_t n3 = u.size(1), n2 = u.size(2), n1 = u.size(3);
   TORCH_CHECK(
       u.is_contiguous() && vol.is_contiguous() &&
@@ -595,6 +668,24 @@ T const* cptr(torch::Tensor const& t) {
 }
 }  // namespace
 
+// each flux comes with its face area, shaped like u
+void check_fluxes(torch::Tensor const& u, torch::Tensor const& f1,
+                  torch::Tensor const& f2, torch::Tensor const& f3,
+                  torch::Tensor const& a1, torch::Tensor const& a2,
+                  torch::Tensor const& a3) {
+  check_operands("fused scalar", u, {&f1, &f2, &f3, &a1, &a2, &a3});
+  TORCH_CHECK(f1.defined() || f2.defined() || f3.defined(),
+              "fused scalar: at least one flux expected");
+  std::initializer_list<std::pair<torch::Tensor const*, torch::Tensor const*>>
+      pairs = {{&f1, &a1}, {&f2, &a2}, {&f3, &a3}};
+  for (auto [f, a] : pairs) {
+    if (!f->defined()) continue;
+    TORCH_CHECK(f->is_contiguous() && f->sizes() == u.sizes(),
+                "fused scalar: fluxes shaped like u expected");
+    TORCH_CHECK(a->defined(), "fused scalar: a flux without its face area");
+  }
+}
+
 // every face the kernels read lies inside the array: lo - 1 >= 0 (donor) and
 // hi + 1 < extent (upper face of the last cell)
 void check_box(at::native::ScalarBox box, Dims n, torch::Tensor const& f1,
@@ -617,16 +708,16 @@ void scalar_theta_cuda(torch::Tensor& theta, torch::Tensor const& u,
                        torch::Tensor const& vol, double dt, double keep,
                        at::native::ScalarBox box) {
   at::cuda::CUDAGuard device_guard(u.device());
+  check_operands("scalar_theta", u, {&theta, &vol});
   check_fused_shapes(u, a1, a2, a3, vol);
-  TORCH_CHECK(theta.is_contiguous() && theta.sizes() == u.sizes());
+  TORCH_CHECK(theta.is_contiguous() && theta.sizes() == u.sizes(),
+              "scalar_theta: theta shaped like u expected");
+  check_fluxes(u, f1, f2, f3, a1, a2, a3);
   check_box(box, dims_of(u), f1, f2, f3);
-  for (auto const* f : {&f1, &f2, &f3})
-    TORCH_CHECK(
-        !f->defined() || (f->is_contiguous() && f->sizes() == u.sizes()),
-        "fused scalar: fluxes shaped like u expected");
   int64_t total = u.numel();
+  if (total == 0) return;
   int threads = 256;
-  int64_t blocks = (total + threads - 1) / threads;
+  int64_t blocks = flat_blocks(total, threads, "scalar_theta");
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES(u.scalar_type(), "scalar_theta_cuda", [&] {
     scalar_theta_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
@@ -642,19 +733,23 @@ void scalar_theta_scale_cuda(torch::Tensor const& theta, torch::Tensor& f1,
                              torch::Tensor& f2, torch::Tensor& f3,
                              at::native::ScalarBox box) {
   at::cuda::CUDAGuard device_guard(theta.device());
-  TORCH_CHECK(theta.is_contiguous());
+  check_operands("scalar_theta_scale", theta, {&f1, &f2, &f3});
+  TORCH_CHECK(theta.dim() == 4 && theta.is_contiguous(),
+              "scalar_theta_scale: contiguous (nvar, nc3, nc2, nc1) theta");
   auto n = dims_of(theta);
   check_box(box, n, f1, f2, f3);
   int64_t total = theta.numel();
+  if (total == 0) return;
   int threads = 256;
-  int64_t blocks = (total + threads - 1) / threads;
+  int64_t blocks = flat_blocks(total, threads, "scalar_theta_scale");
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES(
       theta.scalar_type(), "scalar_theta_scale_cuda", [&] {
         auto run = [&](torch::Tensor& f, int lo, int hi, int64_t stride,
                        int64_t extent) {
           if (!f.defined()) return;
-          TORCH_CHECK(f.is_contiguous() && f.sizes() == theta.sizes());
+          TORCH_CHECK(f.is_contiguous() && f.sizes() == theta.sizes(),
+                      "scalar_theta_scale: fluxes shaped like theta expected");
           scalar_theta_scale_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
               theta.data_ptr<scalar_t>(), f.data_ptr<scalar_t>(), lo, hi,
               stride, extent, total);
@@ -673,18 +768,16 @@ void scalar_divergence_cuda(torch::Tensor& div, torch::Tensor& ds,
                             torch::Tensor const& vol, double dt,
                             at::native::ScalarBox box) {
   at::cuda::CUDAGuard device_guard(div.device());
+  check_operands("scalar_divergence", div, {&ds, &vol});
   check_fused_shapes(div, a1, a2, a3, vol);
-  TORCH_CHECK(ds.is_contiguous() && ds.sizes() == div.sizes());
-  TORCH_CHECK(f1.defined() || f2.defined() || f3.defined(),
-              "At least one flux tensor must be defined");
+  TORCH_CHECK(ds.is_contiguous() && ds.sizes() == div.sizes(),
+              "scalar_divergence: ds shaped like div expected");
+  check_fluxes(div, f1, f2, f3, a1, a2, a3);
   check_box(box, dims_of(div), f1, f2, f3);
-  for (auto const* f : {&f1, &f2, &f3})
-    TORCH_CHECK(
-        !f->defined() || (f->is_contiguous() && f->sizes() == div.sizes()),
-        "fused scalar: fluxes shaped like the divergence expected");
   int64_t total = div.numel();
+  if (total == 0) return;
   int threads = 256;
-  int64_t blocks = (total + threads - 1) / threads;
+  int64_t blocks = flat_blocks(total, threads, "scalar_divergence");
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES(div.scalar_type(), "scalar_divergence_cuda", [&] {
     scalar_divergence_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
