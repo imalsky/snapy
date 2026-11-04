@@ -1,3 +1,6 @@
+// C/C++
+#include <limits>
+
 // torch
 #include <ATen/Dispatch.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -424,6 +427,8 @@ void scalar_weno5_cuda(torch::Tensor& faces, torch::Tensor const& w,
     auto cpp = cp.to(w.scalar_type());
     if (upwind && n <= 1024) {
       int64_t columns = total / n;
+      TORCH_CHECK(columns <= std::numeric_limits<int>::max(),
+                  "scalar_weno5: too many x1 columns for one grid");
       size_t shared = 2 * static_cast<size_t>(n) * sizeof(scalar_t);
       scalar_weno5_x1_flux_kernel<scalar_t><<<columns, n, shared, stream>>>(
           faces.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(),
