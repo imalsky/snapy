@@ -50,8 +50,8 @@ int recon_vars_per_launch(int64_t nline, int64_t ncoeff, size_t scalar_size) {
   constexpr int64_t kSharedLimit = 48 * 1024;
   int64_t n =
       (kSharedLimit / static_cast<int64_t>(scalar_size) - ncoeff) / nline;
-  TORCH_CHECK(n >= 1, "recon line does not fit in shared memory: nline=",
-              nline, " ncoeff=", ncoeff);
+  TORCH_CHECK(n >= 1, "recon line does not fit in shared memory: nline=", nline,
+              " ncoeff=", ncoeff);
   return static_cast<int>(n);
 }
 
@@ -130,12 +130,13 @@ void call_poly_cuda(at::TensorIterator& iter, at::Tensor coeff, int dim) {
       if (nvar <= per) {
         native::stencil_kernel<scalar_t, 2>(
             iter, dim, coeff.numel(),
-            [=] GPU_LAMBDA(char* const data[2], unsigned int strides[2], scalar_t *smem) {
+            [=] GPU_LAMBDA(char* const data[2], unsigned int strides[2],
+                           scalar_t* smem) {
               auto out = reinterpret_cast<scalar_t*>(data[0] + strides[0]);
               auto w = reinterpret_cast<scalar_t*>(data[1] + strides[1]);
-              interp_poly_impl<scalar_t, N>(out, w, c, nvar,
-                                            stride_in1, stride_in2,
-                                            stride_out1, stride_out2, smem);
+              interp_poly_impl<scalar_t, N>(out, w, c, nvar, stride_in1,
+                                            stride_in2, stride_out1,
+                                            stride_out2, smem);
             });
         return;
       }
@@ -148,12 +149,15 @@ void call_poly_cuda(at::TensorIterator& iter, at::Tensor coeff, int dim) {
         int64_t off_out = static_cast<int64_t>(v0) * stride_out2;
         native::stencil_kernel<scalar_t, 2>(
             iter, dim, coeff.numel(),
-            [=] GPU_LAMBDA(char* const data[2], unsigned int strides[2], scalar_t *smem) {
-              auto out = reinterpret_cast<scalar_t*>(data[0] + strides[0]) + off_out;
-              auto w = reinterpret_cast<scalar_t*>(data[1] + strides[1]) + off_in;
-              interp_poly_impl<scalar_t, N>(out, w, c, nv,
-                                            stride_in1, stride_in2,
-                                            stride_out1, stride_out2, smem);
+            [=] GPU_LAMBDA(char* const data[2], unsigned int strides[2],
+                           scalar_t* smem) {
+              auto out =
+                  reinterpret_cast<scalar_t*>(data[0] + strides[0]) + off_out;
+              auto w =
+                  reinterpret_cast<scalar_t*>(data[1] + strides[1]) + off_in;
+              interp_poly_impl<scalar_t, N>(out, w, c, nv, stride_in1,
+                                            stride_in2, stride_out1,
+                                            stride_out2, smem);
             },
             nv);
       }
@@ -196,11 +200,11 @@ void call_weno3_cuda(at::TensorIterator& iter, at::Tensor coeff, int dim, bool s
       if (nvar <= per) {
         native::stencil_kernel<scalar_t, 2>(
             iter, dim, coeff.numel(),
-            [=] __device__ (char* const data[2], unsigned int strides[2], scalar_t *smem) {
+            [=] __device__(char* const data[2], unsigned int strides[2],
+                           scalar_t* smem) {
               auto out = reinterpret_cast<scalar_t*>(data[0] + strides[0]);
               auto w = reinterpret_cast<scalar_t*>(data[1] + strides[1]);
-              interp_weno3_impl(out, w, c, nvar,
-                                stride_in1, stride_in2,
+              interp_weno3_impl(out, w, c, nvar, stride_in1, stride_in2,
                                 stride_out1, stride_out2, scale, smem);
             });
         return;
@@ -214,11 +218,13 @@ void call_weno3_cuda(at::TensorIterator& iter, at::Tensor coeff, int dim, bool s
         int64_t off_out = static_cast<int64_t>(v0) * stride_out2;
         native::stencil_kernel<scalar_t, 2>(
             iter, dim, coeff.numel(),
-            [=] __device__ (char* const data[2], unsigned int strides[2], scalar_t *smem) {
-              auto out = reinterpret_cast<scalar_t*>(data[0] + strides[0]) + off_out;
-              auto w = reinterpret_cast<scalar_t*>(data[1] + strides[1]) + off_in;
-              interp_weno3_impl(out, w, c, nv,
-                                stride_in1, stride_in2,
+            [=] __device__(char* const data[2], unsigned int strides[2],
+                           scalar_t* smem) {
+              auto out =
+                  reinterpret_cast<scalar_t*>(data[0] + strides[0]) + off_out;
+              auto w =
+                  reinterpret_cast<scalar_t*>(data[1] + strides[1]) + off_in;
+              interp_weno3_impl(out, w, c, nv, stride_in1, stride_in2,
                                 stride_out1, stride_out2, scale, smem);
             },
             nv);
@@ -264,11 +270,11 @@ void call_weno5_cuda(at::TensorIterator& iter, at::Tensor coeff, int dim, bool s
       if (nvar <= per) {
         native::stencil_kernel<scalar_t, 2>(
             iter, dim, coeff.numel(),
-            [=] __device__ (char* const data[2], unsigned int strides[2], scalar_t *smem) {
+            [=] __device__(char* const data[2], unsigned int strides[2],
+                           scalar_t* smem) {
               auto out = reinterpret_cast<scalar_t*>(data[0] + strides[0]);
               auto w = reinterpret_cast<scalar_t*>(data[1] + strides[1]);
-              interp_weno5_impl(out, w, c, nvar,
-                                stride_in1, stride_in2,
+              interp_weno5_impl(out, w, c, nvar, stride_in1, stride_in2,
                                 stride_out1, stride_out2, scale, smem);
             });
         return;
@@ -282,11 +288,13 @@ void call_weno5_cuda(at::TensorIterator& iter, at::Tensor coeff, int dim, bool s
         int64_t off_out = static_cast<int64_t>(v0) * stride_out2;
         native::stencil_kernel<scalar_t, 2>(
             iter, dim, coeff.numel(),
-            [=] __device__ (char* const data[2], unsigned int strides[2], scalar_t *smem) {
-              auto out = reinterpret_cast<scalar_t*>(data[0] + strides[0]) + off_out;
-              auto w = reinterpret_cast<scalar_t*>(data[1] + strides[1]) + off_in;
-              interp_weno5_impl(out, w, c, nv,
-                                stride_in1, stride_in2,
+            [=] __device__(char* const data[2], unsigned int strides[2],
+                           scalar_t* smem) {
+              auto out =
+                  reinterpret_cast<scalar_t*>(data[0] + strides[0]) + off_out;
+              auto w =
+                  reinterpret_cast<scalar_t*>(data[1] + strides[1]) + off_in;
+              interp_weno5_impl(out, w, c, nv, stride_in1, stride_in2,
                                 stride_out1, stride_out2, scale, smem);
             },
             nv);
