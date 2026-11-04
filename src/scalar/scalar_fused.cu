@@ -239,7 +239,8 @@ __global__ void scalar_divergence_kernel(
 // path stores right() of cell p - 1 as the left state of face p and left() of
 // cell p as its right state, for faces il..iu+1 and il-1..iu, then copies the
 // edge values outward: the cells used are clamp(p - 1, il - 1, iu - 1) and
-// clamp(p, il, iu).
+// clamp(p, il, iu). Used only for the x1 upwind flux of columns longer than
+// 1024 cells, with the default path's arithmetic (bit for bit).
 template <typename T, bool UPWIND>
 __global__ void scalar_weno5_kernel(T* __restrict__ out,
                                     T const* __restrict__ w,
@@ -274,11 +275,20 @@ __global__ void scalar_weno5_kernel(T* __restrict__ out,
 
 // Both WENO5 values of one cell (left(): cm, the state at its lower face;
 // right(): cp = cm with its columns reversed, the state at its upper face)
-// from one stencil, with the arithmetic of interp_shared_weno5_coeff_impl.
-// The two share vscale, phi and the smoothness indicators exactly: cp's rows
-// 3, 4 are cm's rows 7, 8 and the reverse, and cp's row 6 is minus cm's row 6,
-// so right()'s beta0, beta1, beta2 are left()'s beta2, beta1, beta0, bit for
-// bit, and the middle weight 0.6 / (beta1 + eps)^2 is the same number.
+// from one stencil: the formula of interp_shared_weno5_coeff_impl with fewer
+// divisions, so the values differ from the default path at round-off.
+// - The two share vscale, phi and the smoothness indicators: cp's rows 3, 4
+//   are cm's rows 7, 8 and the reverse, and cp's row 6 is minus cm's row 6, so
+//   right()'s beta0, beta1, beta2 are left()'s beta2, beta1, beta0.
+// - phi = src * (1 / vscale), except where 1 / vscale would overflow.
+// - The weights alpha_k = c_k / d_k, d_k = (beta_k + 1e-6)^2, are ratios, so
+//   they are multiplied through by d0 d1 d2 (with |phi| summing to 5, every
+//   d_j d_k lies in [1e-24, 2e9]); one reciprocal of the two weight sums
+//   serves both faces (fp64), and the quotient is formed before the scale is
+//   applied, so tiny and huge values stay in range. Divisions by variables
+//   go from 12 to 2 (besides the mean's / 5).
+// - Without scaling (scale false) the products are not bounded: the default
+//   formula is used.
 #define SQR(x) ((x) * (x))  // as interp_impl.cuh, which undefines it
 template <typename T>
 __device__ __forceinline__ void weno5_pair(T const* src, T const* cm,
@@ -293,9 +303,12 @@ __device__ __forceinline__ void weno5_pair(T const* src, T const* cm,
     right = 0.0;
     return;
   }
+  // 1 / vscale overflows for subnormal vscale: divide there
+  bool tiny = vscale < (sizeof(T) == 8 ? 1e-300 : 1e-30);
+  T inv = tiny ? T(0) : T(1) / vscale;
   T phi[5];
   for (int k = 0; k < 5; ++k) {
-    phi[k] = src[k] / vscale;
+    phi[k] = tiny ? src[k] / vscale : src[k] * inv;
   }
   T beta0 = 13. / 12. * SQR(_vvdot<5>(phi, cm + 15)) +
             .25 * SQR(_vvdot<5>(phi, cm + 20));
@@ -304,18 +317,42 @@ __device__ __forceinline__ void weno5_pair(T const* src, T const* cm,
   T beta2 = 13. / 12. * SQR(_vvdot<5>(phi, cm + 35)) +
             .25 * SQR(_vvdot<5>(phi, cm + 40));
   T d0 = SQR(beta0 + 1e-6), d1 = SQR(beta1 + 1e-6), d2 = SQR(beta2 + 1e-6);
-  T a1 = .6 / d1;
-  {
+  if (!scale) {
+    T a1 = .6 / d1;
     T p0 = _vvdot<5>(phi, cm), p1 = _vvdot<5>(phi, cm + 5),
       p2 = _vvdot<5>(phi, cm + 10);
     T a0 = .3 / d0, a2 = .1 / d2;
     left = vscale * (a0 * p0 + a1 * p1 + a2 * p2) / (a0 + a1 + a2);
+    p0 = _vvdot<5>(phi, cp), p1 = _vvdot<5>(phi, cp + 5),
+    p2 = _vvdot<5>(phi, cp + 10);
+    a0 = .3 / d2, a2 = .1 / d0;
+    right = vscale * (a0 * p0 + a1 * p1 + a2 * p2) / (a0 + a1 + a2);
+    return;
+  }
+  T e0 = d1 * d2, e1 = d0 * d2, e2 = d0 * d1;
+  T a1 = .6 * e1;
+  T nl, dl, nr, dr;
+  {
+    T p0 = _vvdot<5>(phi, cm), p1 = _vvdot<5>(phi, cm + 5),
+      p2 = _vvdot<5>(phi, cm + 10);
+    T a0 = .3 * e0, a2 = .1 * e2;
+    nl = a0 * p0 + a1 * p1 + a2 * p2;
+    dl = a0 + a1 + a2;
   }
   {
     T p0 = _vvdot<5>(phi, cp), p1 = _vvdot<5>(phi, cp + 5),
       p2 = _vvdot<5>(phi, cp + 10);
-    T a0 = .3 / d2, a2 = .1 / d0;
-    right = vscale * (a0 * p0 + a1 * p1 + a2 * p2) / (a0 + a1 + a2);
+    T a0 = .3 * e2, a2 = .1 * e0;
+    nr = a0 * p0 + a1 * p1 + a2 * p2;
+    dr = a0 + a1 + a2;
+  }
+  if (sizeof(T) == 8) {  // dl dr >= 1e-50: an fp64 normal, not an fp32 one
+    T q = T(1) / (dl * dr);
+    left = vscale * (nl * dr * q);
+    right = vscale * (nr * dl * q);
+  } else {
+    left = vscale * (nl / dl);
+    right = vscale * (nr / dr);
   }
 }
 #undef SQR

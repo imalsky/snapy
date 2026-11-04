@@ -75,7 +75,8 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
   auto r = u / rho;
 
   // fused path (SNAP_SCALAR_FUSED=1, CUDA): the same arithmetic in a few
-  // kernels (scalar_fused.cu); WENO5 reconstruction only
+  // kernels (scalar_fused.cu), except WENO5's weights, which take fewer
+  // divisions (round-off differences); WENO5 reconstruction only
   bool fused = scalar_fused_enabled() && u.is_cuda() &&
                u.scalar_type() == torch::kFloat64;
   auto weno5 =

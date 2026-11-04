@@ -8,7 +8,9 @@
 // SNAP_SCALAR_FUSED=1 and the scalar lives on a CUDA device. Each kernel
 // computes, per element, the same operations in the same order as the libtorch
 // expressions it replaces, with every product, sum and quotient rounded
-// separately (no contraction), so the fused path reproduces the default one.
+// separately (no contraction), so it reproduces the default path bit for bit;
+// the one exception is the WENO5 reconstruction (call_scalar_weno5), whose
+// weights take fewer divisions and so differ at round-off.
 
 namespace snap {
 //! true when SNAP_SCALAR_FUSED=1 (read once)
@@ -60,7 +62,9 @@ using scalar_divergence_fn = void (*)(
 
 //! ReconstructImpl::forward of a scalar with WENO5 along tensor dimension
 //! `dim` (3: x1, 2: x2, 1: x3): every face's left (ILT) and right (IRT) state
-//! from the same device function, the same edge copies and the clamp at 0.
+//! with the same edge copies and the clamp at 0; the WENO5 weights take fewer
+//! divisions than the default path's (round-off differences; the x1 upwind
+//! flux of columns longer than 1024 cells keeps the default arithmetic).
 //! faces: (2, nvar, nc3, nc2, nc1). When `vel` is defined (x1 only) the
 //! kernel writes instead the upwind flux vel * (ui * wl + (1 - ui) * wr) into
 //! `faces` shaped (nvar, nc3, nc2, nc1).

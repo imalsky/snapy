@@ -14,6 +14,7 @@ setup_test(test_weno)
 setup_test(test_riemann)
 if(CUDA)
   setup_test(test_weno5_cuda_line)
+  setup_test(test_scalar_fused_weno5)
 endif()
 setup_test(test_backward_substitution)
 setup_test(test_lu_failure)
@@ -419,7 +420,8 @@ if(CUDA)
   snapy_add_python_test(test_scalar_flux_covariance_cuda
     SCRIPT test_scalar_flux_covariance.py ARGS --device cuda
     TIMEOUT 300 LABELS "python;hydro;scalar;cuda")
-  # the fused passive-scalar path (SNAP_SCALAR_FUSED=1) against the default path, bit for bit
+  # the fused passive-scalar path (SNAP_SCALAR_FUSED=1) against the default path: the flow and the PLM case
+  # bit for bit, the WENO5 cases to round-off
   snapy_add_python_test(test_scalar_fused
     TIMEOUT 600 LABELS "python;scalar;cuda")
   set_tests_properties(

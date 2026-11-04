@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""The fused passive-scalar path (SNAP_SCALAR_FUSED=1, CUDA, float64) gives the same bits as the default path.
+"""The fused passive-scalar path (SNAP_SCALAR_FUSED=1, CUDA, float64) against the default path.
 
 Each case runs NSTEP rk3 steps twice, once per switch value, in child processes (the switch is read once
-per process), and compares a hash of every block's hydro_u and scalar_s:
+per process). The flow does not see the scalars, so every block's hydro_u must be bit for bit the same. The
+fused kernels reproduce the default path's arithmetic except the WENO5 weights, which take fewer divisions:
+with WENO5 each scalar must agree to TOL relative to the largest value within RAD cells along each axis (round-off
+is relative to the values a cell's stencils combine: next to a sharp front a cell far below the front's height is a
+near-cancellation of front-sized terms); with PLM (no WENO5 kernel, every other fused kernel) bit for bit. Cases:
   sphere       six gnomonic cubed-sphere panels in one process: WENO5, implicit-scheme 9, eos limiter,
                face-flux covariance with its centroid part, tracers over many decades
   sphere_cov0  the same with SNAP_FLUX_COVARIANCE=0 (no covariance row)
@@ -21,10 +25,11 @@ import subprocess
 import sys
 import tempfile
 
+import numpy as np
 import torch
 import yaml
 
-NSTEP, NVAR = 4, 6
+NSTEP, NVAR, TOL, RAD = 4, 6, 1.0e-12, 4
 CASES = ("sphere", "sphere_cov0", "sphere_ub", "sphere_plm", "box")
 
 
@@ -70,11 +75,27 @@ def config(case):
     return cfg
 
 
+def local_max(x, r=RAD):
+    """max |x| over a box of +-r cells along each spatial axis of (block, nc3, nc2, nc1), cut at the edges"""
+    m = np.abs(x)
+    for ax in (1, 2, 3):
+        out = m.copy()
+        n = m.shape[ax]
+        for s in range(1, min(r, n - 1) + 1):
+            lo = [slice(None)] * 4
+            hi = [slice(None)] * 4
+            lo[ax], hi[ax] = slice(0, n - s), slice(s, n)
+            out[tuple(lo)] = np.maximum(out[tuple(lo)], m[tuple(hi)])
+            out[tuple(hi)] = np.maximum(out[tuple(hi)], m[tuple(lo)])
+        m = out
+    return m
+
+
 def digest(t):
     return hashlib.sha256(t.detach().contiguous().cpu().numpy().tobytes()).hexdigest()
 
 
-def run(case):
+def run(case, save):
     import snapy
     from snapy import Mesh, MeshOptions, kIDN, kIPR, kIV1, kIV2, kIV3
     cfg = config(case)
@@ -139,26 +160,28 @@ def run(case):
             mesh.forward(variables, dt, st)
         err = mesh.check_redo(variables)
         assert err == 0, f"redo request {err}"
+    np.save(save, torch.stack([v["scalar_s"] for v in variables]).cpu().numpy())
     return {"case": case, "fused": os.environ.get("SNAP_SCALAR_FUSED", "0"),
             "hydro_u": [digest(v["hydro_u"]) for v in variables],
-            "scalar_s": [digest(v["scalar_s"]) for v in variables],
             "finite": bool(all(torch.isfinite(v["scalar_s"]).all() for v in variables))}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--child", default=None, choices=CASES)
+    ap.add_argument("--save", default=None)
     a = ap.parse_args()
     if not torch.cuda.is_available():
         print("CUDA is not available")
         sys.exit(125)
     torch.set_default_dtype(torch.float64)
     if a.child:
-        print(json.dumps(run(a.child)), flush=True)
+        print(json.dumps(run(a.child, a.save)), flush=True)
         return
     failures = []
+    tmpdir = tempfile.mkdtemp(dir=os.getcwd())
     for case in CASES:
-        res = {}
+        res, arr = {}, {}
         for fused in ("0", "1"):
             env = dict(os.environ)
             env["SNAP_SCALAR_FUSED"] = fused
@@ -166,22 +189,40 @@ def main():
                 env["SNAP_FLUX_COVARIANCE"] = "0"
             else:
                 env.pop("SNAP_FLUX_COVARIANCE", None)
-            out = subprocess.run([sys.executable, os.path.abspath(__file__), "--child", case], env=env,
-                                 capture_output=True, text=True)
+            save = os.path.join(tmpdir, f"{case}_{fused}.npy")
+            out = subprocess.run([sys.executable, os.path.abspath(__file__), "--child", case, "--save", save],
+                                 env=env, capture_output=True, text=True)
             rows = [l for l in out.stdout.splitlines() if l.startswith("{")]
             if out.returncode or not rows:
                 print(out.stderr[-3000:], flush=True)
                 failures.append(f"{case} fused={fused}: child exit {out.returncode}")
                 continue
             res[fused] = json.loads(rows[-1])
+            arr[fused] = np.load(save)
+            os.unlink(save)
         if len(res) < 2:
             continue
-        same = res["0"]["hydro_u"] == res["1"]["hydro_u"] and res["0"]["scalar_s"] == res["1"]["scalar_s"]
-        print(f"{case:12s} fused vs default: {'bitwise identical' if same else 'DIFFERENT'}", flush=True)
-        if not same:
-            failures.append(f"{case}: fused and default paths differ")
+        if res["0"]["hydro_u"] != res["1"]["hydro_u"]:
+            failures.append(f"{case}: the flow differs (hydro_u)")
         if not (res["0"]["finite"] and res["1"]["finite"]):
             failures.append(f"{case}: non-finite tracers")
+        a0, a1 = arr["0"], arr["1"]
+        if case == "sphere_plm":
+            same = a0.shape == a1.shape and np.array_equal(a0.view(np.uint64), a1.view(np.uint64))
+            print(f"{case:12s} fused vs default: {'bitwise identical' if same else 'DIFFERENT'}", flush=True)
+            if not same:
+                failures.append(f"{case}: fused and default paths differ")
+            continue
+        worst = 0.0
+        for k in range(NVAR):
+            x0, x1 = a0[:, k], a1[:, k]
+            err = float((np.abs(x1 - x0) / np.maximum(local_max(x0), 1.0e-320)).max())
+            if not err <= TOL:
+                failures.append(f"{case}: tracer {k} differs by {err:.3g} of the local largest value (> {TOL})")
+            worst = max(worst, err) if err == err else float("nan")
+        print(f"{case:12s} fused vs default: hydro_u bitwise {res['0']['hydro_u'] == res['1']['hydro_u']}, "
+              f"scalars within {worst:.3g} of the local largest value", flush=True)
+    os.rmdir(tmpdir)
     for failure in failures:
         print("FAIL", failure)
     sys.exit(bool(failures))
