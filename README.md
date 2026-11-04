@@ -144,6 +144,10 @@ Run-wide scheme switches are read once from the environment. The x2/x3
 face-flux covariance correction (`SNAP_FLUX_COVARIANCE`, #289;
 `docs/derivations/289-covariance-x3-curved.md`) is on by default; set
 `SNAP_FLUX_COVARIANCE=0` (or `false`, `off`, `no`) to turn it off.
+`SNAP_SCALAR_FUSED=1` moves passive-scalar transport on CUDA (float64) into a
+few fused kernels (`src/scalar/scalar_fused.cu`): bit for bit the default path,
+except the WENO5 reconstruction, whose weights take fewer divisions and differ
+at round-off. It is off by default.
 
 ## Development
 
