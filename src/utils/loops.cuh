@@ -67,9 +67,12 @@ void gpu_kernel(at::TensorIterator& iter, const func_t& f) {
   });
 }
 
+// nvar_shared: variables held in shared memory per line; -1 means all of
+// them (dim 0 of the output). A caller that splits the variables over
+// several launches passes the size of one part.
 template <typename scalar_t, int Arity, typename func_t>
 void stencil_kernel(at::TensorIterator& iter, int dim, int buffers,
-                    const func_t& f) {
+                    const func_t& f, int nvar_shared = -1) {
   TORCH_CHECK(iter.ninputs() + iter.noutputs() == Arity);
 
   std::array<char*, Arity> data;
@@ -108,7 +111,8 @@ void stencil_kernel(at::TensorIterator& iter, int dim, int buffers,
   dim3 grid(len[2] / block.x, len[1] / block.y, len[0] / block.z);
 
   // number of variables
-  int nvar = at::native::ensure_nonempty_size(iter.output(), 0);
+  int nvar = nvar_shared >= 0 ? nvar_shared
+                              : at::native::ensure_nonempty_size(iter.output(), 0);
   size_t shared = (block.x * nvar + buffers) * sizeof(scalar_t);
 
   auto stream = at::cuda::getCurrentCUDAStream();

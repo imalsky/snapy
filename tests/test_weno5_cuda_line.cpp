@@ -5,8 +5,10 @@
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <cmath>
 #include <exception>
 #include <snap/recon/interpolation.hpp>
+#include <vector>
 
 #include "cuda_test_gate.hpp"
 
@@ -50,19 +52,19 @@ torch::Tensor recon_left(Kind kind, torch::Tensor w, int dim,
   auto input = w.to(device);
   if (kind == Kind::Weno5) {
     Weno5Interp recon;
-    recon->to(device);
+    recon->to(device, w.scalar_type());
     recon->left(input, dim, out);
   } else if (kind == Kind::Weno3) {
     Weno3Interp recon;
-    recon->to(device);
+    recon->to(device, w.scalar_type());
     recon->left(input, dim, out);
   } else if (kind == Kind::Cp5) {
     Center5Interp recon;
-    recon->to(device);
+    recon->to(device, w.scalar_type());
     recon->left(input, dim, out);
   } else {
     Center3Interp recon;
-    recon->to(device);
+    recon->to(device, w.scalar_type());
     recon->left(input, dim, out);
   }
   if (device.is_cuda()) {
@@ -139,5 +141,65 @@ TEST(recon_cuda, line_above_1024_matches_cpu) {
       }
     }
     expect_matches_cpu(kind, wide, /*dim=*/2);
+  }
+}
+
+// One launch holds every variable's whole line in the default 48 KB of shared
+// memory, so 106-cell lines (100 layers and 3 ghosts a side) held at most 57
+// fp64 (115 fp32) variables and a 69-tracer scalar could not launch. Larger
+// counts are split over several launches; each variable must come out bit for
+// bit as when it is reconstructed alone, along x1 (contiguous) and along a
+// strided dimension, at the split boundary and well past it.
+TEST(recon_cuda, many_variables_match_one_at_a_time) {
+  if (!snapy_cuda_test_enabled()) {
+    GTEST_SKIP() << "no CUDA device";
+  }
+  struct Case {
+    torch::Dtype dtype;
+    torch::Dtype bits;
+    int nvar;
+  };
+  Case cases[] = {{torch::kFloat64, torch::kInt64, 57},
+                  {torch::kFloat64, torch::kInt64, 58},
+                  {torch::kFloat64, torch::kInt64, 90},
+                  {torch::kFloat32, torch::kInt32, 116}};
+  Kind kinds[] = {Kind::Weno5, Kind::Weno3, Kind::Cp5, Kind::Cp3};
+  for (auto const& cs : cases) {
+    auto opts = torch::TensorOptions().dtype(cs.dtype);
+    for (Kind kind : kinds) {
+      for (int dim : {3, 2}) {
+        for (int n : {70, 106}) {
+          std::vector<int64_t> shape = {cs.nvar, 2, 3, 3};
+          shape[dim] = n;
+          auto w = torch::empty(shape, opts);
+          auto x = torch::arange(w[0].numel(), opts).view(w[0].sizes());
+          for (int v = 0; v < cs.nvar; ++v) {
+            // values over many decades, as chemical tracers have
+            w[v] = std::pow(10., -0.3 * (v % 60)) *
+                   (1.5 + torch::sin((v + 1) * x / 37.));
+          }
+          torch::Tensor all;
+          try {
+            all = recon_left(kind, w, dim, torch::kCUDA).cpu();
+          } catch (std::exception const& err) {
+            ADD_FAILURE() << kind_name(kind) << " dim=" << dim << " n=" << n
+                          << " nvar=" << cs.nvar
+                          << " CUDA failed: " << err.what();
+            continue;
+          }
+          for (int v = 0; v < cs.nvar; ++v) {
+            auto one = recon_left(kind, w.narrow(0, v, 1).contiguous(), dim,
+                                  torch::kCUDA)
+                           .cpu();
+            ASSERT_TRUE(
+                torch::equal(all.narrow(0, v, 1).contiguous().view(cs.bits),
+                             one.view(cs.bits)))
+                << kind_name(kind) << " dim=" << dim << " n=" << n
+                << " nvar=" << cs.nvar << " variable " << v
+                << " differs from its own launch";
+          }
+        }
+      }
+    }
   }
 }
