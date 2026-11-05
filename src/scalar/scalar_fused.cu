@@ -1,6 +1,10 @@
 // C/C++
+#include <algorithm>
 #include <initializer_list>
 #include <limits>
+#include <mutex>
+#include <set>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -41,6 +45,34 @@ int64_t flat_blocks(int64_t total, int threads, char const* who) {
   TORCH_CHECK(blocks <= std::numeric_limits<int>::max(), who,
               ": too many elements for one grid");
   return blocks;
+}
+// The fused WENO5 kernels write out the uniform-grid table of
+// Weno5InterpImpl (wenol0 ... below): any other table is refused. The check
+// compares in the table's own dtype (as the kernels' T(...) constants round)
+// and runs once per table state (data pointer, version counter and dtype; one
+// copy to the host).
+void check_uniform_weno5(torch::Tensor const& cm, char const* who) {
+  static std::mutex mu;
+  static std::set<std::tuple<void const*, int64_t, int>> seen;
+  std::tuple<void const*, int64_t, int> key{cm.data_ptr(),
+                                            static_cast<int64_t>(cm._version()),
+                                            static_cast<int>(cm.scalar_type())};
+  std::lock_guard<std::mutex> lock(mu);
+  if (seen.count(key)) return;
+  static double const table[45] = {
+      -1. / 6., 5. / 6., 1. / 3., 0.,  0.,       0.,       1. / 3., 5. / 6.,
+      -1. / 6., 0.,      0.,      0.,  11. / 6., -7. / 6., 1. / 3., 1.,
+      -2.,      1.,      0.,      0.,  1.,       -4.,      3.,      0.,
+      0.,       0.,      1.,      -2., 1.,       0.,       0.,      -1.,
+      0.,       1.,      0.,      0.,  0.,       1.,       -2.,     1.,
+      0.,       0.,      3.,      -4., 1.};
+  auto want =
+      torch::from_blob(const_cast<double*>(table), {45}, torch::kFloat64)
+          .to(cm.scalar_type());
+  TORCH_CHECK(torch::equal(cm.reshape({45}).cpu(), want), who,
+              ": the fused path writes out the uniform-grid WENO5 table; this "
+              "reconstruction uses another one");
+  seen.insert(key);
 }
 }  // namespace
 
@@ -324,10 +356,63 @@ __global__ void scalar_weno5_long_flux_kernel(
   out[idx] = rmul(v, radd(rmul(u, wl), rmul(rsub(T(1), u), wr)));
 }
 
-// Both WENO5 values of one cell (left(): cm, the state at its lower face;
-// right(): cp = cm with its columns reversed, the state at its upper face)
-// from one stencil: the formula of interp_shared_weno5_coeff_impl with fewer
-// divisions, so the values differ from the default path at round-off.
+#define SQR(x) ((x) * (x))  // as interp_impl.cuh, which undefines it
+// The rows of Weno5InterpImpl::cm (the uniform-grid WENO5 table) as fma chains
+// over their nonzero entries, in index order. _vvdot<5> (interp_impl.cuh)
+// builds the same chains (out = 0; out += v1[i] * v2[i], contracted to fma),
+// and a zero entry adds exactly zero there, so for finite stencils these are
+// bit for bit the table's dot products, without loading the table (the one
+// exception: where an intermediate sum is -0 from an underflowed product, a
+// skipped zero term no longer turns it into +0, so a zero face of the unscaled
+// formula may change its sign).
+// Rows 0-2: the candidate polynomials of left(); cp (cm with its columns
+// reversed) gives right()'s as wenor0..2. Rows 3-8: the smoothness terms.
+template <typename T>
+__device__ __forceinline__ T fma0(T a, T c) {
+  return fma(a, c, T(0));
+}
+template <typename T>
+__device__ __forceinline__ T wenol0(T const* f) {
+  return fma(f[2], T(1. / 3.), fma(f[1], T(5. / 6.), fma0(f[0], T(-1. / 6.))));
+}
+template <typename T>
+__device__ __forceinline__ T wenol1(T const* f) {
+  return fma(f[3], T(-1. / 6.), fma(f[2], T(5. / 6.), fma0(f[1], T(1. / 3.))));
+}
+template <typename T>
+__device__ __forceinline__ T wenol2(T const* f) {
+  return fma(f[4], T(1. / 3.), fma(f[3], T(-7. / 6.), fma0(f[2], T(11. / 6.))));
+}
+template <typename T>
+__device__ __forceinline__ T wenor0(T const* f) {
+  return fma(f[4], T(-1. / 6.), fma(f[3], T(5. / 6.), fma0(f[2], T(1. / 3.))));
+}
+template <typename T>
+__device__ __forceinline__ T wenor1(T const* f) {
+  return fma(f[3], T(1. / 3.), fma(f[2], T(5. / 6.), fma0(f[1], T(-1. / 6.))));
+}
+template <typename T>
+__device__ __forceinline__ T wenor2(T const* f) {
+  return fma(f[2], T(11. / 6.), fma(f[1], T(-7. / 6.), fma0(f[0], T(1. / 3.))));
+}
+template <typename T>
+__device__ __forceinline__ void weno5_smooth(T const* f, T& b0, T& b1, T& b2) {
+  T s3 = fma(f[2], T(1), fma(f[1], T(-2), fma0(f[0], T(1))));
+  T s4 = fma(f[2], T(3), fma(f[1], T(-4), fma0(f[0], T(1))));
+  T s5 = fma(f[3], T(1), fma(f[2], T(-2), fma0(f[1], T(1))));
+  T s6 = fma(f[3], T(1), fma0(f[1], T(-1)));
+  T s7 = fma(f[4], T(1), fma(f[3], T(-2), fma0(f[2], T(1))));
+  T s8 = fma(f[4], T(1), fma(f[3], T(-4), fma0(f[2], T(3))));
+  b0 = 13. / 12. * SQR(s3) + .25 * SQR(s4);
+  b1 = 13. / 12. * SQR(s5) + .25 * SQR(s6);
+  b2 = 13. / 12. * SQR(s7) + .25 * SQR(s8);
+}
+
+// Both WENO5 values of one cell (left(): the state at its lower face; right():
+// the state at its upper face) from one stencil: the formula of
+// interp_shared_weno5_coeff_impl with the uniform-grid table written out
+// (above) and fewer divisions, so the values differ from the default path at
+// round-off.
 // - The two share vscale, phi and the smoothness indicators: cp's rows 3, 4
 //   are cm's rows 7, 8 and the reverse, and cp's row 6 is minus cm's row 6, so
 //   right()'s beta0, beta1, beta2 are left()'s beta2, beta1, beta0.
@@ -341,10 +426,8 @@ __global__ void scalar_weno5_long_flux_kernel(
 //   Divisions by variables go from 12 to 2 (besides the mean's / 5).
 // - Without scaling (scale false) the products are not bounded: the default
 //   formula is used.
-#define SQR(x) ((x) * (x))  // as interp_impl.cuh, which undefines it
 template <typename T>
-__device__ __forceinline__ void weno5_pair(T const* src, T const* cm,
-                                           T const* cp, bool scale, T& left,
+__device__ __forceinline__ void weno5_pair(T const* src, bool scale, T& left,
                                            T& right) {
   T vscale = scale ? (fabs(src[0]) + fabs(src[1]) + fabs(src[2]) +
                       fabs(src[3]) + fabs(src[4])) /
@@ -362,21 +445,15 @@ __device__ __forceinline__ void weno5_pair(T const* src, T const* cm,
   for (int k = 0; k < 5; ++k) {
     phi[k] = tiny ? src[k] / vscale : src[k] * inv;
   }
-  T beta0 = 13. / 12. * SQR(_vvdot<5>(phi, cm + 15)) +
-            .25 * SQR(_vvdot<5>(phi, cm + 20));
-  T beta1 = 13. / 12. * SQR(_vvdot<5>(phi, cm + 25)) +
-            .25 * SQR(_vvdot<5>(phi, cm + 30));
-  T beta2 = 13. / 12. * SQR(_vvdot<5>(phi, cm + 35)) +
-            .25 * SQR(_vvdot<5>(phi, cm + 40));
+  T beta0, beta1, beta2;
+  weno5_smooth(phi, beta0, beta1, beta2);
   T d0 = SQR(beta0 + 1e-6), d1 = SQR(beta1 + 1e-6), d2 = SQR(beta2 + 1e-6);
   if (!scale) {
     T a1 = .6 / d1;
-    T p0 = _vvdot<5>(phi, cm), p1 = _vvdot<5>(phi, cm + 5),
-      p2 = _vvdot<5>(phi, cm + 10);
+    T p0 = wenol0(phi), p1 = wenol1(phi), p2 = wenol2(phi);
     T a0 = .3 / d0, a2 = .1 / d2;
     left = vscale * (a0 * p0 + a1 * p1 + a2 * p2) / (a0 + a1 + a2);
-    p0 = _vvdot<5>(phi, cp), p1 = _vvdot<5>(phi, cp + 5),
-    p2 = _vvdot<5>(phi, cp + 10);
+    p0 = wenor0(phi), p1 = wenor1(phi), p2 = wenor2(phi);
     a0 = .3 / d2, a2 = .1 / d0;
     right = vscale * (a0 * p0 + a1 * p1 + a2 * p2) / (a0 + a1 + a2);
     return;
@@ -385,15 +462,13 @@ __device__ __forceinline__ void weno5_pair(T const* src, T const* cm,
   T a1 = .6 * e1;
   T nl, dl, nr, dr;
   {
-    T p0 = _vvdot<5>(phi, cm), p1 = _vvdot<5>(phi, cm + 5),
-      p2 = _vvdot<5>(phi, cm + 10);
+    T p0 = wenol0(phi), p1 = wenol1(phi), p2 = wenol2(phi);
     T a0 = .3 * e0, a2 = .1 * e2;
     nl = a0 * p0 + a1 * p1 + a2 * p2;
     dl = a0 + a1 + a2;
   }
   {
-    T p0 = _vvdot<5>(phi, cp), p1 = _vvdot<5>(phi, cp + 5),
-      p2 = _vvdot<5>(phi, cp + 10);
+    T p0 = wenor0(phi), p1 = wenor1(phi), p2 = wenor2(phi);
     T a0 = .3 * e2, a2 = .1 * e0;
     nr = a0 * p0 + a1 * p1 + a2 * p2;
     dr = a0 + a1 + a2;
@@ -415,9 +490,7 @@ __device__ __forceinline__ void weno5_pair(T const* src, T const* cm,
 // cells il-1..iu-1), plus the default path's edge copies.
 template <typename T>
 __global__ void scalar_weno5_faces_kernel(T* __restrict__ out,
-                                          T const* __restrict__ w,
-                                          T const* __restrict__ cm,
-                                          T const* __restrict__ cp, bool scale,
+                                          T const* __restrict__ w, bool scale,
                                           int64_t stride, int n,
                                           int64_t total) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -432,7 +505,7 @@ __global__ void scalar_weno5_faces_kernel(T* __restrict__ out,
     src[q] = w[base + static_cast<int64_t>(p - 2 + q) * stride];
   }
   T l, r;
-  weno5_pair(src, cm, cp, scale, l, r);
+  weno5_pair(src, scale, l, r);
   l = clamp0(l);
   r = clamp0(r);
   T* ilt = out;
@@ -457,10 +530,10 @@ __global__ void scalar_weno5_faces_kernel(T* __restrict__ out,
 // memory, then each face takes right() of the cell below and left() of the
 // cell above (with the edge copies) for the upwind flux.
 template <typename T>
-__global__ void scalar_weno5_x1_flux_kernel(
-    T* __restrict__ flux, T const* __restrict__ w, T const* __restrict__ cm,
-    T const* __restrict__ cp, bool scale, int n, int64_t ncolumn_cell,
-    T const* __restrict__ vel) {
+__global__ void scalar_weno5_x1_flux_kernel(T* __restrict__ flux,
+                                            T const* __restrict__ w, bool scale,
+                                            int n, int64_t ncolumn_cell,
+                                            T const* __restrict__ vel) {
   extern __shared__ unsigned char smem_raw[];
   T* sl = reinterpret_cast<T*>(smem_raw);
   T* sr = sl + n;
@@ -473,7 +546,7 @@ __global__ void scalar_weno5_x1_flux_kernel(
 #pragma unroll
     for (int q = 0; q < 5; ++q) src[q] = w[base + p - 2 + q];
     T l, r;
-    weno5_pair(src, cm, cp, scale, l, r);
+    weno5_pair(src, scale, l, r);
     sl[p] = clamp0(l);
     sr[p] = clamp0(r);
   }
@@ -518,31 +591,30 @@ void scalar_weno5_cuda(torch::Tensor& faces, torch::Tensor const& w,
                 ": faces (2, nvar, nc3, nc2, nc1) expected");
   }
   if (total == 0) return;
+  if (!upwind || n <= 1024) check_uniform_weno5(cm, who);  // the fused kernels
   int64_t ncell = total / w.size(0);
   int threads = 256;
   int64_t blocks = flat_blocks(total, threads, who);
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "scalar_weno5_cuda", [&] {
-    auto cmp = cm.to(w.scalar_type());
-    auto cpp = cp.to(w.scalar_type());
     if (upwind && n <= 1024) {
       int64_t columns = total / n;
       TORCH_CHECK(columns <= std::numeric_limits<int>::max(),
                   "scalar_weno5: too many x1 columns for one grid");
       size_t shared = 2 * static_cast<size_t>(n) * sizeof(scalar_t);
       scalar_weno5_x1_flux_kernel<scalar_t><<<columns, n, shared, stream>>>(
-          faces.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(),
-          cmp.data_ptr<scalar_t>(), cpp.data_ptr<scalar_t>(), scale, n,
+          faces.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(), scale, n,
           ncell / n, vel.data_ptr<scalar_t>());
     } else if (upwind) {
+      auto cmp = cm.to(w.scalar_type());
+      auto cpp = cp.to(w.scalar_type());
       scalar_weno5_long_flux_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
           faces.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(),
           cmp.data_ptr<scalar_t>(), cpp.data_ptr<scalar_t>(), scale, stride, n,
           total, ncell, vel.data_ptr<scalar_t>());
     } else {
       scalar_weno5_faces_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
-          faces.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(),
-          cmp.data_ptr<scalar_t>(), cpp.data_ptr<scalar_t>(), scale, stride, n,
+          faces.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(), scale, stride, n,
           total);
     }
   });

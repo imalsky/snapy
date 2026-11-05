@@ -680,6 +680,10 @@ void MeshBlockImpl::advance_local(Variables &vars, double dt, int stage) {
           w.wght1(), w.wght2());
       return;
     }
+    if (scalar_fused_enabled())
+      TORCH_WARN_ONCE(
+          "SNAP_SCALAR_FUSED=1: the dry-source carry runs the default path "
+          "(it needs contiguous CUDA float64 tensors)");
     auto s_base = pintg->forward(stage, _scalar_s0, scalar_s, scalar_base);
     auto remove_r =
         torch::where(rho_base.unsqueeze(0) == 0., vars.at("scalar_r"),
@@ -719,6 +723,10 @@ void MeshBlockImpl::advance_local(Variables &vars, double dt, int stage) {
                                                   fut_scalar_ds, r.contiguous(),
                                                   M.contiguous(), vol);
       } else {
+        if (scalar_fused_enabled())
+          TORCH_WARN_ONCE(
+              "SNAP_SCALAR_FUSED=1: the implicit tracer transfer runs the "
+              "default path (it needs contiguous CUDA float64 tensors)");
         auto r_below = torch::zeros_like(r);
         r_below.slice(-1, 1, nc1) = r.slice(-1, 0, nc1 - 1);
         auto P = torch::where(M > 0., r_below, r) * M;
@@ -852,6 +860,10 @@ void MeshBlockImpl::advance_local(Variables &vars, double dt, int stage) {
                                        w.wght1(), w.wght2());
       scalar_s.set_(avg);
     } else {
+      if (scalar_fused_enabled())
+        TORCH_WARN_ONCE(
+            "SNAP_SCALAR_FUSED=1: the scalar stage average runs the default "
+            "path (it needs contiguous CUDA float64 tensors)");
       scalar_s.set_(pintg->forward(stage, _scalar_s0, scalar_s, fut_scalar_ds));
     }
     set_scalar_primitive(vars, scalar_s, hydro_u);

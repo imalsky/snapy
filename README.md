@@ -147,7 +147,11 @@ face-flux covariance correction (`SNAP_FLUX_COVARIANCE`, #289;
 `SNAP_SCALAR_FUSED=1` moves passive-scalar transport on CUDA (float64) into a
 few fused kernels (`src/scalar/scalar_fused.cu`): bit for bit the default path,
 except the WENO5 reconstruction, whose weights take fewer divisions and differ
-at round-off. It is off by default.
+at round-off. It is off by default. The upper-bound limiter, a column split in
+x1 with the flux covariance, and x1 columns longer than 1024 cells keep the
+default code; any other part that cannot run fused (CPU or non-float64
+tensors, a reconstruction other than WENO5) warns once, and a WENO5 table other
+than the uniform-grid one is refused.
 
 ## Development
 

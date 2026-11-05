@@ -82,6 +82,14 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
   auto weno5 =
       fused ? std::dynamic_pointer_cast<Weno5InterpImpl>(precon->pinterp1)
             : nullptr;
+  if (scalar_fused_enabled() && !fused)
+    TORCH_WARN_ONCE(
+        "SNAP_SCALAR_FUSED=1: scalar transport runs the default path (it "
+        "needs CUDA float64 tensors)");
+  if (fused && !weno5)
+    TORCH_WARN_ONCE(
+        "SNAP_SCALAR_FUSED=1: the scalar reconstruction runs the default path "
+        "(only WENO5 is fused)");
   auto recon = [&](int dim) {
     if (!weno5) return precon->forward(r, dim);
     auto rc = r.contiguous();
@@ -141,6 +149,10 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
     }
   }
 
+  // the ratio is not read after the reconstructions: free it now, as the face
+  // states below once their flux is formed (lower peak memory per tracer)
+  r = torch::Tensor();
+
   if (playout->options->type() == "cubed-sphere") {
     bool exchange_dim2 = _flux2.defined();
     bool exchange_dim3 = _flux3.defined();
@@ -185,6 +197,10 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
                                            vel, factors);
       return flux;
     }
+    if (fused)
+      TORCH_WARN_ONCE(
+          "SNAP_SCALAR_FUSED=1: the lateral scalar flux of a column split in "
+          "x1 with the flux covariance runs the default path");
     auto dcov = pmb->phydro->scalar_flux_covariance(rlr[ILT], rlr[IRT], dim);
     if (!dcov.defined())
       return priemann->forward(rlr[ILT], rlr[IRT], dim, mass);
@@ -195,10 +211,14 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
 
   if (_flux2.defined()) {
     _flux2.set_(lateral(rtmp2, DIM2, pmb->phydro->flux2()[IDN]));
+    rtmp2 = torch::Tensor();  // the face states and their exchange views
+    send_vars2.clear();
   }
 
   if (_flux3.defined()) {
     _flux3.set_(lateral(rtmp3, DIM3, pmb->phydro->flux3()[IDN]));
+    rtmp3 = torch::Tensor();
+    send_vars3.clear();
   }
 
   // Tracer flux positivity limiter: same scheme (and same rationale) as the
