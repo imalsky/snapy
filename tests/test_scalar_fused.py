@@ -21,16 +21,15 @@ The positivity limiter must act (cells with theta < 1) in the PLM cases, the sam
 
   python test_scalar_fused.py
 """
+
 import argparse
 import hashlib
 import json
-import math
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-
 from typing import Dict
 
 import numpy as np
@@ -41,14 +40,14 @@ import yaml
 class _DrySource(torch.nn.Module):
     """Adds 1e-4 of the dry density in even x1 columns and removes it in odd ones."""
 
-    def forward(self, variables: Dict[str, torch.Tensor], dt: float,
-                stage: int) -> Dict[str, torch.Tensor]:
+    def forward(self, variables: Dict[str, torch.Tensor], dt: float, stage: int) -> Dict[str, torch.Tensor]:
         rho = variables["hydro_u"][0]
         i = torch.arange(rho.size(-1), dtype=rho.dtype, device=rho.device)
         sign = 1.0 - 2.0 * torch.remainder(i, 2.0)
         du = torch.zeros_like(variables["hydro_u"])
         du[0] = 1.0e-4 * rho * sign
         return {"hydro_du": du}
+
 
 NSTEP, NVAR, TOL, RAD = 4, 6, 1.0e-12, 4
 CASES = ("sphere", "sphere_cov0", "sphere_ub", "sphere_plm", "sphere_cov0_plm", "box", "box_plm", "box_dry_plm")
@@ -57,37 +56,68 @@ CASES = ("sphere", "sphere_cov0", "sphere_ub", "sphere_plm", "sphere_cov0_plm", 
 def config(case):
     sphere = case.startswith("sphere")
     if sphere:
-        geometry = {"type": "gnomonic-equiangle",
-                    "bounds": {"x1min": 1.6628e7, "x1max": 1.7128e7, "x2min_pi": -0.25, "x2max_pi": 0.25,
-                               "x3min_pi": -0.25, "x3max_pi": 0.25},
-                    "cells": {"nx1": 12, "nx2": 8, "nx3": 8, "nghost": 3}}
+        geometry = {
+            "type": "gnomonic-equiangle",
+            "bounds": {
+                "x1min": 1.6628e7,
+                "x1max": 1.7128e7,
+                "x2min_pi": -0.25,
+                "x2max_pi": 0.25,
+                "x3min_pi": -0.25,
+                "x3max_pi": 0.25,
+            },
+            "cells": {"nx1": 12, "nx2": 8, "nx3": 8, "nghost": 3},
+        }
         lateral = "custom"
     else:
-        geometry = {"type": "cartesian",
-                    "bounds": {"x1min": 0., "x1max": 1.e4, "x2min": 0., "x2max": 2.e4, "x3min": 0., "x3max": 2.e4},
-                    "cells": {"nx1": 12, "nx2": 10, "nx3": 8, "nghost": 3}}
+        geometry = {
+            "type": "cartesian",
+            "bounds": {"x1min": 0.0, "x1max": 1.0e4, "x2min": 0.0, "x2max": 2.0e4, "x3min": 0.0, "x3max": 2.0e4},
+            "cells": {"nx1": 12, "nx2": 10, "nx3": 8, "nghost": 3},
+        }
         lateral = "periodic"
     cfg = {
         "reference-state": {"Tref": 0.0, "Pref": 1.0e5},
         "species": [{"name": "dry", "composition": {"H": 2}, "cv_R": 2.5}],
         "geometry": geometry,
-        "dynamics": {"equation-of-state": {"type": "ideal-moist", "density-floor": 1.0e-10,
-                                           "pressure-floor": 1.0e-10, "limiter": True, "max-iter": 30,
-                                           "ftol": 1.0e-6},
-                     "reconstruct": {"vertical": {"type": "weno5", "scale": True, "shock": True},
-                                     "horizontal": {"type": "weno5", "scale": True, "shock": True}},
-                     "riemann-solver": {"type": "hllc"}},
-        "boundary-condition": {"external": {"x1-inner": "reflecting", "x1-outer": "reflecting",
-                                            "x2-inner": lateral, "x2-outer": lateral,
-                                            "x3-inner": lateral, "x3-outer": lateral}},
-        "integration": {"type": "rk3", "cfl": 0.45, "implicit-scheme": 9 if sphere else 0, "nlim": -1,
-                        "tlim": 1.0e12, "ncycle_out": 0},
+        "dynamics": {
+            "equation-of-state": {
+                "type": "ideal-moist",
+                "density-floor": 1.0e-10,
+                "pressure-floor": 1.0e-10,
+                "limiter": True,
+                "max-iter": 30,
+                "ftol": 1.0e-6,
+            },
+            "reconstruct": {
+                "vertical": {"type": "weno5", "scale": True, "shock": True},
+                "horizontal": {"type": "weno5", "scale": True, "shock": True},
+            },
+            "riemann-solver": {"type": "hllc"},
+        },
+        "boundary-condition": {
+            "external": {
+                "x1-inner": "reflecting",
+                "x1-outer": "reflecting",
+                "x2-inner": lateral,
+                "x2-outer": lateral,
+                "x3-inner": lateral,
+                "x3-outer": lateral,
+            }
+        },
+        "integration": {
+            "type": "rk3",
+            "cfl": 0.45,
+            "implicit-scheme": 9 if sphere else 0,
+            "nlim": -1,
+            "tlim": 1.0e12,
+            "ncycle_out": 0,
+        },
         "forcing": {"const-gravity": {"grav1": -13.5}},
         "scalar": {"nvar": NVAR, "riemann-solver": {"type": "upwind"}},
     }
     if sphere:
-        cfg["distribute"] = {"layout": "cubed-sphere", "nb2": 1, "nb3": 1, "blocks_per_process": 6,
-                             "verbose": False}
+        cfg["distribute"] = {"layout": "cubed-sphere", "nb2": 1, "nb3": 1, "blocks_per_process": 6, "verbose": False}
         cfg["forcing"]["coriolis"] = {"type": "xyz", "omega1": 2.2e-6}
     if case == "sphere_ub":
         cfg["scalar"]["upper-bound"] = 1.0
@@ -119,6 +149,7 @@ def digest(t):
 def run(case, save):
     import snapy
     from snapy import Mesh, MeshOptions, kIDN, kIPR, kIV1, kIV2, kIV3
+
     cfg = config(case)
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, dir=os.getcwd()) as f:
         yaml.safe_dump(cfg, f)
@@ -187,9 +218,13 @@ def run(case, save):
         assert err == 0, f"redo request {err}"
     np.save(save, torch.stack([v["scalar_s"] for v in variables]).cpu().numpy())
     hits = sum(int(dict(b.named_buffers())["scalar.positivity_hits"].sum()) for b in blocks)
-    return {"case": case, "fused": os.environ.get("SNAP_SCALAR_FUSED", "0"), "positivity_hits": hits,
-            "hydro_u": [digest(v["hydro_u"]) for v in variables],
-            "finite": bool(all(torch.isfinite(v["scalar_s"]).all() for v in variables))}
+    return {
+        "case": case,
+        "fused": os.environ.get("SNAP_SCALAR_FUSED", "0"),
+        "positivity_hits": hits,
+        "hydro_u": [digest(v["hydro_u"]) for v in variables],
+        "finite": bool(all(torch.isfinite(v["scalar_s"]).all() for v in variables)),
+    }
 
 
 def main():
@@ -217,9 +252,13 @@ def main():
             else:
                 env.pop("SNAP_FLUX_COVARIANCE", None)
             save = os.path.join(tmpdir, f"{case}_{fused}.npy")
-            out = subprocess.run([sys.executable, os.path.abspath(__file__), "--child", case, "--save", save],
-                                 env=env, capture_output=True, text=True)
-            rows = [l for l in out.stdout.splitlines() if l.startswith("{")]
+            out = subprocess.run(
+                [sys.executable, os.path.abspath(__file__), "--child", case, "--save", save],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            rows = [line for line in out.stdout.splitlines() if line.startswith("{")]
             if out.returncode or not rows:
                 print(out.stderr[-3000:], flush=True)
                 failures.append(f"{case} fused={fused}: child exit {out.returncode}")
@@ -237,8 +276,11 @@ def main():
         h0, h1 = res["0"]["positivity_hits"], res["1"]["positivity_hits"]
         if case.endswith("_plm"):
             same = a0.shape == a1.shape and np.array_equal(a0.view(np.uint64), a1.view(np.uint64))
-            print(f"{case:16s} fused vs default: {'bitwise identical' if same else 'DIFFERENT'}, "
-                  f"positivity-limited cells {h0} / {h1}", flush=True)
+            print(
+                f"{case:16s} fused vs default: {'bitwise identical' if same else 'DIFFERENT'}, "
+                f"positivity-limited cells {h0} / {h1}",
+                flush=True,
+            )
             if not same:
                 failures.append(f"{case}: fused and default paths differ")
             if h0 != h1:
@@ -252,9 +294,11 @@ def main():
             if not err <= TOL:
                 failures.append(f"{case}: tracer {k} differs by {err:.3g} of the local largest value (> {TOL})")
             worst = max(worst, err) if err == err else float("nan")
-        print(f"{case:16s} fused vs default: hydro_u bitwise {res['0']['hydro_u'] == res['1']['hydro_u']}, "
-              f"scalars within {worst:.3g} of the local largest value, positivity-limited cells {h0} / {h1}",
-              flush=True)
+        print(
+            f"{case:16s} fused vs default: hydro_u bitwise {res['0']['hydro_u'] == res['1']['hydro_u']}, "
+            f"scalars within {worst:.3g} of the local largest value, positivity-limited cells {h0} / {h1}",
+            flush=True,
+        )
     shutil.rmtree(tmpdir)
     if not limited:
         failures.append("the positivity limiter never acted in a bit-for-bit case, so it was not tested")
