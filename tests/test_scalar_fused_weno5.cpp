@@ -195,3 +195,34 @@ TEST(scalar_fused, weno5_fp32_subnormal_scale) {
     check(rec, w.to(dev), dim, true, 1e-5, "fp32 dim " + std::to_string(dim));
   }
 }
+
+// The kernels write out the uniform-grid tables, so they must refuse a
+// reconstruction whose left (cm) or right (cp) table is any other: the
+// default path reads both, and a changed cp moved its result while the fused
+// result stayed put.
+TEST(scalar_fused, weno5_refuses_other_tables) {
+  if (!snapy_cuda_test_enabled()) {
+    GTEST_SKIP() << "no CUDA device";
+  }
+  torch::Device dev(torch::kCUDA, 0);
+  auto rec = make_rec(true, dev, torch::kFloat64);
+  auto weno5 = std::dynamic_pointer_cast<Weno5InterpImpl>(rec->pinterp1);
+  ASSERT_TRUE(weno5);
+  auto w = make_lines(20, 3).to(dev);
+  auto vel = torch::ones_like(w[0]);
+  for (bool right : {false, true}) {
+    auto cm = weno5->cm.clone();
+    auto cp = weno5->cp.clone();
+    (right ? cp : cm)[0][2] += 0.125;
+    auto faces = torch::empty({2, NVAR, 3, 2, 20}, w.options());
+    EXPECT_THROW(at::native::call_scalar_weno5(dev.type(), faces, w, cm, cp,
+                                               true, 3, torch::Tensor()),
+                 c10::Error)
+        << (right ? "cp" : "cm") << " changed, face states";
+    auto flux = torch::empty_like(w);
+    EXPECT_THROW(at::native::call_scalar_weno5(dev.type(), flux, w, cm, cp,
+                                               true, 3, vel),
+                 c10::Error)
+        << (right ? "cp" : "cm") << " changed, x1 upwind flux";
+  }
+}

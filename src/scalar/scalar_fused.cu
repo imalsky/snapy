@@ -46,17 +46,20 @@ int64_t flat_blocks(int64_t total, int threads, char const* who) {
               ": too many elements for one grid");
   return blocks;
 }
-// The fused WENO5 kernels write out the uniform-grid table of
-// Weno5InterpImpl (wenol0 ... below): any other table is refused. The check
-// compares in the table's own dtype (as the kernels' T(...) constants round)
-// and runs once per table state (data pointer, version counter and dtype; one
-// copy to the host).
-void check_uniform_weno5(torch::Tensor const& cm, char const* who) {
+// The fused WENO5 kernels write out the uniform-grid tables of
+// Weno5InterpImpl (wenol0 ... below): cm for the left face and its mirror cp
+// for the right. Any other table is refused. The check compares in the
+// table's own dtype (as the kernels' T(...) constants round) and runs once per
+// table state (data pointers, version counters and dtype; one copy each to the
+// host).
+void check_uniform_weno5(torch::Tensor const& cm, torch::Tensor const& cp,
+                         char const* who) {
   static std::mutex mu;
-  static std::set<std::tuple<void const*, int64_t, int>> seen;
-  std::tuple<void const*, int64_t, int> key{cm.data_ptr(),
-                                            static_cast<int64_t>(cm._version()),
-                                            static_cast<int>(cm.scalar_type())};
+  using Key = std::tuple<void const*, int64_t, void const*, int64_t, int>;
+  static std::set<Key> seen;
+  Key key{cm.data_ptr(), static_cast<int64_t>(cm._version()), cp.data_ptr(),
+          static_cast<int64_t>(cp._version()),
+          static_cast<int>(cm.scalar_type())};
   std::lock_guard<std::mutex> lock(mu);
   if (seen.count(key)) return;
   static double const table[45] = {
@@ -67,11 +70,14 @@ void check_uniform_weno5(torch::Tensor const& cm, char const* who) {
       0.,       1.,      0.,      0.,  0.,       1.,       -2.,     1.,
       0.,       0.,      3.,      -4., 1.};
   auto want =
-      torch::from_blob(const_cast<double*>(table), {45}, torch::kFloat64)
+      torch::from_blob(const_cast<double*>(table), {9, 5}, torch::kFloat64)
           .to(cm.scalar_type());
-  TORCH_CHECK(torch::equal(cm.reshape({45}).cpu(), want), who,
-              ": the fused path writes out the uniform-grid WENO5 table; this "
-              "reconstruction uses another one");
+  TORCH_CHECK(cp.scalar_type() == cm.scalar_type() &&
+                  torch::equal(cm.reshape({9, 5}).cpu(), want) &&
+                  torch::equal(cp.reshape({9, 5}).cpu(), want.flip({1})),
+              who,
+              ": the fused path writes out the uniform-grid WENO5 tables; "
+              "this reconstruction uses other ones");
   seen.insert(key);
 }
 }  // namespace
@@ -591,7 +597,7 @@ void scalar_weno5_cuda(torch::Tensor& faces, torch::Tensor const& w,
                 ": faces (2, nvar, nc3, nc2, nc1) expected");
   }
   if (total == 0) return;
-  if (!upwind || n <= 1024) check_uniform_weno5(cm, who);  // the fused kernels
+  if (!upwind || n <= 1024) check_uniform_weno5(cm, cp, who);  // the fused kernels
   int64_t ncell = total / w.size(0);
   int threads = 256;
   int64_t blocks = flat_blocks(total, threads, who);
