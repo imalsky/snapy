@@ -34,7 +34,12 @@ void bind_coord(py::module &m) {
       .ADD_OPTION(int, snap::CoordinateOptionsImpl, nx1)
       .ADD_OPTION(int, snap::CoordinateOptionsImpl, nx2)
       .ADD_OPTION(int, snap::CoordinateOptionsImpl, nx3)
-      .ADD_OPTION(int, snap::CoordinateOptionsImpl, nghost);
+      .ADD_OPTION(int, snap::CoordinateOptionsImpl, nghost)
+      .ADD_OPTION(std::vector<double>, snap::CoordinateOptionsImpl,
+                  x1f_interior)
+      .def("stretched_x1", &snap::CoordinateOptionsImpl::stretched_x1)
+      .def("x1f_ghosts", &snap::CoordinateOptionsImpl::x1f_ghosts)
+      .def("global_x1f", &snap::CoordinateOptionsImpl::global_x1f);
 
   auto pyCoordinate =
       py::class_<snap::CoordinateImpl, snap::Coordinate>(m, "Coordinate");

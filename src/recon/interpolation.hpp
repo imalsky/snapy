@@ -57,6 +57,19 @@ class InterpImpl {
 
   virtual int stencils() const { return 1; }
 
+  virtual void set_x1_coeffs(torch::Tensor const& /*x1f*/) {
+    TORCH_CHECK(false, "[", options->type(),
+                "] has no stretched-x1 reconstruction: route A builds "
+                "per-face coefficients for weno5 and cp5 only, and running ",
+                options->type(),
+                " here would silently apply uniform-grid arithmetic to a "
+                "non-uniform x1.  A deck that declares a stretched x1 "
+                "(cells/x1rat or geometry/x1f) must reconstruct x1 with "
+                "weno5 or cp5 (note Sec. 4.7)");
+  }
+
+  virtual bool has_x1_coeffs() const { return false; }
+
   virtual std::pair<torch::Tensor, torch::Tensor> forward(
       torch::Tensor w, int dim,
       torch::optional<torch::Tensor> wl = torch::nullopt,
@@ -203,6 +216,10 @@ class Center5InterpImpl : public torch::nn::Cloneable<Center5InterpImpl>,
   //! data
   torch::Tensor cm, cp;
 
+  torch::Tensor cm_x1, cp_x1;
+
+  torch::Tensor cm_x1_cast, cp_x1_cast;
+
   //! Constructor to initialize the layer
   Center5InterpImpl() {
     options->type("cp5");
@@ -218,6 +235,12 @@ class Center5InterpImpl : public torch::nn::Cloneable<Center5InterpImpl>,
 
   int stencils() const override { return 5; }
 
+  void set_x1_coeffs(torch::Tensor const& x1f) override;
+  bool has_x1_coeffs() const override { return cm_x1.numel() > 0; }
+
+  void forward_nu(torch::Tensor const& w, int dim, torch::Tensor const& out,
+                  torch::Tensor const& src, torch::Tensor& cache);
+
   void left(torch::Tensor w, int dim, torch::Tensor const& out) override;
   void right(torch::Tensor w, int dim, torch::Tensor const& out) override;
 };
@@ -228,6 +251,10 @@ class Weno5InterpImpl : public torch::nn::Cloneable<Weno5InterpImpl>,
  public:
   //! data
   torch::Tensor cm, cp;
+
+  torch::Tensor cm_x1, cp_x1;
+
+  torch::Tensor cm_x1_cast, cp_x1_cast;
 
   //! Constructor to initialize the layer
   Weno5InterpImpl() {
@@ -243,6 +270,12 @@ class Weno5InterpImpl : public torch::nn::Cloneable<Weno5InterpImpl>,
   using InterpImpl::forward;
 
   int stencils() const override { return 5; }
+
+  void set_x1_coeffs(torch::Tensor const& x1f) override;
+  bool has_x1_coeffs() const override { return cm_x1.numel() > 0; }
+
+  void forward_nu(torch::Tensor const& w, int dim, torch::Tensor const& out,
+                  torch::Tensor const& src, torch::Tensor& cache);
 
   void left(torch::Tensor w, int dim, torch::Tensor const& out) override;
   void right(torch::Tensor w, int dim, torch::Tensor const& out) override;

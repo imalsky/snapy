@@ -97,7 +97,7 @@ Ref reference(torch::Tensor const& w, torch::Tensor const& dx1f, int iu,
   at::native::call_hydro_ref_x1(w.device().type(), w.contiguous(),
                                 dx1f.contiguous(), anchor, r.psf_lo, r.psf_hi,
                                 r.pref, r.dsf, r.dref, iu, kGrav, uniform,
-                                phys_in, phys_out, wall_clamp);
+                                phys_in, phys_out, wall_clamp, torch::Tensor());
   return r;
 }
 

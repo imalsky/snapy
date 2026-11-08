@@ -103,6 +103,7 @@ class ScalarImpl : public torch::nn::Cloneable<ScalarImpl> {
   //! submodules
   Coordinate pcoord = nullptr;
   Reconstruct precon = nullptr;
+  Reconstruct precon1 = nullptr;
   RiemannSolver priemann = nullptr;
   torch::Tensor _flux1, _flux2, _flux3, _div;
   //! cumulative count of (cell, tracer) entries with positivity theta < 1

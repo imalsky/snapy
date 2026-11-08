@@ -234,3 +234,10 @@ bool is_outflow(bcfunc_t const& func) {
   auto ptr = func.target<Pointer>();
   return ptr && (*ptr == outflow_inner || *ptr == outflow_outer);
 }
+
+bool is_reflecting(bcfunc_t const& func) {
+  using Pointer =
+      void (*)(torch::Tensor const&, int, snap::BoundaryFuncOptions);
+  auto ptr = func.target<Pointer>();
+  return ptr && (*ptr == reflecting_inner || *ptr == reflecting_outer);
+}

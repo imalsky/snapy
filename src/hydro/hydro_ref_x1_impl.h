@@ -10,6 +10,8 @@
 // snap
 #include <snap/snap.h>
 
+#include "hydro_dispatch.hpp"
+
 namespace snap {
 
 template <typename T>
@@ -66,9 +68,20 @@ inline DISPATCH_MACRO void hydro_ref_x1_scan_impl(T const* w, T const* dx1f,
 //! [r0 (r0 / r1)^k, r0 (1 + k)] for r1 >= 0: positive, and bounded above when
 //! r1 is nearly empty. A non-positive value keeps the wall cell.
 template <typename T>
-inline DISPATCH_MACRO T hydro_ref_x1_wall_rop(T r0, T r1, int k) {
-  T e = r1 > r0 ? r0 * pow(r0 / r1, T(k)) : r0 + T(k) * (r0 - r1);
+inline DISPATCH_MACRO T hydro_ref_x1_wall_rop(T r0, T r1, T k) {
+  T e = r1 > r0 ? r0 * pow(r0 / r1, k) : r0 + k * (r0 - r1);
   return e > T(0) ? e : r0;
+}
+
+template <typename T>
+inline DISPATCH_MACRO T hydro_ref_x1_wall_steps(T const* dx1f, int jw, int dir,
+                                                int k) {
+  T d = T(0.5) * dx1f[jw];
+  for (int m = 1; m <= k; ++m) {
+    T hm = dx1f[jw - dir * (m - 1)];
+    d += (m < k) ? hm : T(0.5) * hm;
+  }
+  return d / (T(0.5) * (dx1f[jw] + dx1f[jw - dir]));
 }
 
 //! rho/p smoothed by a 5-point binomial along x1: the reference must
@@ -84,10 +97,9 @@ inline DISPATCH_MACRO T hydro_ref_x1_wall_rop(T r0, T r1, int k) {
 //! O(dz) error at the first faces (docs/derivations/wb-ref-wall.md). Only
 //! owned cells are read.
 template <typename T>
-inline DISPATCH_MACRO T hydro_ref_x1_rop_smooth(T const* w, int ncells,
-                                                int flat, int nc1, int i,
-                                                int jlo, int jhi, bool ext_lo,
-                                                bool ext_hi) {
+inline DISPATCH_MACRO T hydro_ref_x1_rop_smooth(
+    T const* w, int ncells, int flat, int nc1, int i, int jlo, int jhi,
+    bool ext_lo, bool ext_hi, T const* dx1f = nullptr, bool stretched = false) {
   auto rop = [&](int j) {
     return w[IDN * ncells + flat + j] / w[IPR * ncells + flat + j];
   };
@@ -95,11 +107,19 @@ inline DISPATCH_MACRO T hydro_ref_x1_rop_smooth(T const* w, int ncells,
   for (int m = -2; m <= 2; ++m) {
     int j = i + m;
     if (j < jlo) {
-      v[m + 2] = ext_lo ? hydro_ref_x1_wall_rop(rop(jlo), rop(jlo + 1), jlo - j)
-                        : rop(jlo);
+      v[m + 2] =
+          ext_lo ? hydro_ref_x1_wall_rop(rop(jlo), rop(jlo + 1),
+                                         stretched ? hydro_ref_x1_wall_steps(
+                                                         dx1f, jlo, -1, jlo - j)
+                                                   : T(jlo - j))
+                 : rop(jlo);
     } else if (j > jhi) {
-      v[m + 2] = ext_hi ? hydro_ref_x1_wall_rop(rop(jhi), rop(jhi - 1), j - jhi)
-                        : rop(jhi);
+      v[m + 2] =
+          ext_hi ? hydro_ref_x1_wall_rop(rop(jhi), rop(jhi - 1),
+                                         stretched ? hydro_ref_x1_wall_steps(
+                                                         dx1f, jhi, +1, j - jhi)
+                                                   : T(j - jhi))
+                 : rop(jhi);
     } else {
       v[m + 2] = rop(j);
     }
@@ -107,11 +127,30 @@ inline DISPATCH_MACRO T hydro_ref_x1_rop_smooth(T const* w, int ncells,
   return (v[0] + T(4) * v[1] + T(6) * v[2] + T(4) * v[3] + v[4]) / T(16);
 }
 
+inline DISPATCH_MACRO int hydro_ref_x1_six_face_start(int i, int nc1, int iu,
+                                                      bool phys_in,
+                                                      bool phys_out,
+                                                      bool wall_clamp) {
+  int il = nc1 - 1 - iu;
+  bool thin = (iu - il + 1) < 5;
+  bool fits = iu >= 4;
+  bool wall_in = wall_clamp && phys_in && i >= il && i < il + 2;
+  bool wall_out = wall_clamp && phys_out && i > iu - 2 && i <= iu;
+  int start = -1;
+  if (i >= 2 && i < nc1 - 2 && !wall_in && !wall_out) start = i - 2;
+  if (wall_in && fits && !(thin && phys_out)) start = il;
+  if (wall_out && fits && !(thin && phys_in)) start = iu + 1 - 5;
+  if (!phys_in && i < 2) start = 0;
+  if (!phys_out && i >= nc1 - 2) start = nc1 - 5;
+  return start;
+}
+
 template <typename T>
 inline DISPATCH_MACRO void hydro_ref_x1_cell_impl(
     T const* w, T const* dx1f, T const* psf_lo, T const* psf_hi, T* pref,
     T* dsf, T* dref, int column, int i, int ncolumns, int nc1, int iu, T grav,
-    bool uniform, bool phys_in, bool phys_out, bool wall_clamp) {
+    int x1_grid, bool phys_in, bool phys_out, bool wall_clamp, T const* rows) {
+  bool uniform = x1_grid == kX1RefUniform;
   int ncells = ncolumns * nc1;
   int flat = column * nc1;
   int il = nc1 - 1 - iu;
@@ -178,6 +217,18 @@ inline DISPATCH_MACRO void hydro_ref_x1_cell_impl(
       int row = 4 - sigma;
       use_six_faces(nc1 - 5, w6e[row], true);
     }
+  } else if (x1_grid == kX1RefStretched) {
+    T lower = lo < hi ? lo : hi;
+    T upper = lo > hi ? lo : hi;
+    int start = static_cast<int>(rows[7 * i]);
+    if (start >= 0) {
+      T value = T(0);
+      for (int m = 0; m < 6; ++m) {
+        value += rows[7 * i + 1 + m] *
+                 hydro_ref_x1_face(psf_lo, psf_hi, flat, start + m, nc1);
+      }
+      if (value >= lower && value <= upper) cell_pref = value;
+    }
   } else {
     T dp = grav * w[IDN * ncells + flat + i] * dx1f[i];
     T ratio = lo / hi;
@@ -190,12 +241,17 @@ inline DISPATCH_MACRO void hydro_ref_x1_cell_impl(
   int jhi = (wall_clamp && phys_out) ? iu : nc1 - 1;
   bool ext_lo = wall_clamp && phys_in && il + 1 <= iu;
   bool ext_hi = wall_clamp && phys_out && iu - 1 >= il;
+  bool stretched = x1_grid == kX1RefStretched;
   T rs = hydro_ref_x1_rop_smooth(w, ncells, flat, nc1, i, jlo, jhi, ext_lo,
-                                 ext_hi);
-  T rf = i > 0 ? T(0.5) * (hydro_ref_x1_rop_smooth(w, ncells, flat, nc1, i - 1,
-                                                   jlo, jhi, ext_lo, ext_hi) +
-                           rs)
-               : rs;
+                                 ext_hi, dx1f, stretched);
+  T rf = rs;
+  if (i > 0) {
+    T rs_dn = hydro_ref_x1_rop_smooth(w, ncells, flat, nc1, i - 1, jlo, jhi,
+                                      ext_lo, ext_hi, dx1f, stretched);
+    rf = stretched
+             ? (dx1f[i] * rs_dn + dx1f[i - 1] * rs) / (dx1f[i - 1] + dx1f[i])
+             : T(0.5) * (rs_dn + rs);
+  }
   dref[flat + i] = cell_pref * rs;
   dsf[flat + i] = lo * rf;
 }
@@ -204,13 +260,13 @@ template <typename T>
 inline DISPATCH_MACRO void hydro_ref_x1_impl(
     T const* w, T const* dx1f, T const* anchor, T* psf_lo, T* psf_hi, T* pref,
     T* dsf, T* dref, int column, int ncolumns, int nc1, int iu, T grav,
-    bool uniform, bool phys_in, bool phys_out, bool wall_clamp) {
+    int x1_grid, bool phys_in, bool phys_out, bool wall_clamp, T const* rows) {
   hydro_ref_x1_scan_impl(w, dx1f, anchor, psf_lo, psf_hi, column, ncolumns, nc1,
                          iu, grav);
   for (int i = 0; i < nc1; ++i) {
     hydro_ref_x1_cell_impl(w, dx1f, psf_lo, psf_hi, pref, dsf, dref, column, i,
-                           ncolumns, nc1, iu, grav, uniform, phys_in, phys_out,
-                           wall_clamp);
+                           ncolumns, nc1, iu, grav, x1_grid, phys_in, phys_out,
+                           wall_clamp, rows);
   }
 }
 

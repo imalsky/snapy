@@ -347,6 +347,9 @@ void DiffusionImpl::reset() {
 
   auto coord = phydro->pmb->pcoord;
   auto enabled = options->nu_iso() > 0. || options->kappa_iso() > 0.;
+  TORCH_CHECK(!enabled || !coord->options->stretched_x1(),
+              "[Diffusion] not supported on a stretched x1 (geometry/x1f or "
+              "cells/x1rat, #280): its x1 differences assume uniform cells");
   bool spherical = coord->options->type() == "gnomonic-equiangle";
   TORCH_CHECK(!options->implicit_radial() ||
                   (spherical && phydro->peos->options->type() == "ideal-gas"),

@@ -11,6 +11,12 @@ setup_test(test_vic_partial_tangential)
 setup_test(test_radiating_boundary)
 setup_test(test_plm)
 setup_test(test_weno)
+setup_test(test_x1_coeffs)
+setup_test(test_x1_dim_guard)
+setup_test(test_x1_stretched_refusal)
+setup_test(test_x1_qmax_guard)
+setup_test(test_hydro_ref_x1_rf_wall)
+setup_test(test_uniform_module_tree)
 setup_test(test_riemann)
 if(CUDA)
   setup_test(test_weno5_cuda_line)
@@ -24,6 +30,30 @@ setup_test(test_rectify)
 setup_test(test_flip_zero_count)
 setup_test(test_cubed_sphere_exchange)
 setup_test(test_coordinate)
+setup_test(test_stretched_x1)
+setup_test(test_deck_x1_wiring)
+setup_test(test_stretched_x1_ref)
+foreach(_arm "wb_ref4;SNAP_WB_REF4=1" "x1_centroid;SNAP_X1_CENTROID_EXACT=1")
+  list(GET _arm 0 _name)
+  list(GET _arm 1 _env)
+  add_test(NAME test_stretched_x1_ref_${_name}.${buildl}
+           COMMAND test_stretched_x1_ref.${buildl}
+                   --gtest_filter=StretchedX1Ref.refuses_wb_ref4_switch:StretchedX1Ref.balance_column_refuses_wb_ref4)
+  set_tests_properties(test_stretched_x1_ref_${_name}.${buildl}
+                       PROPERTIES ENVIRONMENT "${_env}")
+endforeach()
+add_test(NAME test_stretched_x1_ref_radial_exact_off.${buildl}
+         COMMAND test_stretched_x1_ref.${buildl}
+                 --gtest_filter=StretchedX1Ref.refuses_curvature_with_radial_exact_off)
+set_tests_properties(test_stretched_x1_ref_radial_exact_off.${buildl}
+                     PROPERTIES ENVIRONMENT "SNAP_GRAVITY_WORK_RADIAL_EXACT=0")
+add_test(NAME test_stretched_x1_ref_x1_mass_covariance.${buildl}
+         COMMAND test_stretched_x1_ref.${buildl}
+                 --gtest_filter=StretchedX1Ref.refuses_x1_mass_covariance_switch)
+set_tests_properties(
+  test_stretched_x1_ref_x1_mass_covariance.${buildl}
+  PROPERTIES ENVIRONMENT "SNAP_X1_MASS_COVARIANCE=1"
+             PASS_REGULAR_EXPRESSION "\\[  PASSED  \\] 1 test\\.")
 setup_test(test_radial_face_moments)
 setup_test(test_hydrostatic)
 setup_test(test_hydro_options)
@@ -62,6 +92,11 @@ set_tests_properties(test_yamlcpp_cstdint_patch PROPERTIES
 setup_test(test_sedimentation_guards)
 setup_test(test_balance_column)
 setup_test(test_hydro_ref_x1)
+add_test(NAME test_hydro_ref_x1_stretched_cuda.${buildl}
+         COMMAND test_hydro_ref_x1.${buildl}
+                 --gtest_filter=HydroRefX1Dispatch.cuda_matches_cpu_on_the_stretched_rows)
+set_tests_properties(test_hydro_ref_x1_stretched_cuda.${buildl}
+                     PROPERTIES TIMEOUT 120 LABELS "hydro;gpu")
 setup_test(test_uranus_cycle1_abort)
 setup_test(test_pref_local_seam)
 # UCzhangxi/snapy#44: the same 4-vs-1 x1-block comparison (200 steps, 1e-12)
@@ -460,6 +495,11 @@ set_tests_properties(test_python_import_path_python PROPERTIES
   SKIP_RETURN_CODE 125
 )
 
+snapy_add_python_test(test_example_ic_stretched TIMEOUT 120 LABELS "python;examples"
+  ARGS --exe ${CMAKE_BINARY_DIR}/bin/run_hydro.${buildl})
+set_tests_properties(test_example_ic_stretched_python PROPERTIES
+                     SKIP_RETURN_CODE 125)
+
 file(GLOB inputs *.yaml *.py)
 # create tests folder if does not exist
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
@@ -696,4 +736,23 @@ if(NOT CUDA)
       set_tests_properties(${_t} PROPERTIES DISABLED TRUE)
     endif()
   endforeach()
+endif()
+
+add_executable(g3_decks.${buildl} EXCLUDE_FROM_ALL g3_decks.cpp)
+set_target_properties(g3_decks.${buildl}
+                      PROPERTIES COMPILE_FLAGS ${CMAKE_CXX_FLAGS_${buildu}})
+target_include_directories(
+  g3_decks.${buildl}
+  PRIVATE ${CMAKE_BINARY_DIR}
+          ${KINTERA_INCLUDE_DIR}
+          ${SNAP_INCLUDE_DIR}
+          ${HARP_INCLUDE_DIR}
+          ${NETCDF_INCLUDES}
+          ${TORCH_INCLUDE_DIR}
+          ${TORCH_API_INCLUDE_DIR})
+target_link_libraries(g3_decks.${buildl}
+  PRIVATE snapy::snap
+          $<IF:$<BOOL:${CUDAToolkit_FOUND}>,snapy::snap_cu,>)
+if (UNIX AND NOT APPLE)
+  target_link_options(g3_decks.${buildl} PRIVATE -Wl,--no-as-needed)
 endif()

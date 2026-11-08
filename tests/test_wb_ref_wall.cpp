@@ -141,7 +141,7 @@ Faces face_errors(int nx1, Profile const& prof,
                                 torch::Tensor(), psf_lo, psf_hi, pref, dsf,
                                 dref, iu, /*grav=*/1., /*uniform=*/true,
                                 /*phys_in=*/true, /*phys_out=*/true,
-                                /*wall_clamp=*/true);
+                                /*wall_clamp=*/true, torch::Tensor());
 
   // the solver's face densities (hydro_forward.cpp): reconstruct rho - dref
   // with even-parity wall ghosts, then add dsf back

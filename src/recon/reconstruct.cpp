@@ -76,6 +76,11 @@ void ReconstructImpl::reset() {
   pinterp2 = InterpImpl::create(options->interp(), this, "interp2");
 }
 
+void ReconstructImpl::set_x1_faces(torch::Tensor const& x1f) {
+  pinterp1->set_x1_coeffs(x1f);
+  pinterp2->set_x1_coeffs(x1f);
+}
+
 torch::Tensor ReconstructImpl::forward(torch::Tensor w, int dim, bool floor) {
   auto vec = w.sizes().vec();
   vec.insert(vec.begin(), 2);

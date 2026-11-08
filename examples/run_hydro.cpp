@@ -113,7 +113,8 @@ int main(int argc, char **argv) {
     w.narrow(0, ICY, ny).select(3, i) = thermo_x->compute("X->Y", {xfrac});
 
     if ((temp < Tmin).any().item<double>()) break;
-    dz = pcoord->dx1f[i].item<double>();
+    // step centre i -> i+1 by the centre spacing, not the cell width
+    dz = pcoord->dx1v[i + 1].item<double>();
     thermo_x->extrapolate_dz(
         temp, pres, xfrac,
         kintera::ExtrapOptions().dz(dz).grav(grav).ds_dz(0.));
@@ -122,7 +123,7 @@ int main(int argc, char **argv) {
   // isothermal extrapolation
   for (; i <= iu; ++i) {
     auto mu = (thermo_x->mu * xfrac).sum(-1);
-    dz = pcoord->dx1f[i].item<double>();
+    dz = pcoord->dx1v[i].item<double>();  // centre i-1 -> i
     pres *= exp(-grav * mu * dz / (kintera::constants::Rgas * temp));
     auto conc = thermo_x->compute("TPX->V", {temp, pres, xfrac});
     w[IPR].select(2, i) = pres;

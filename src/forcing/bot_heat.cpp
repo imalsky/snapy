@@ -37,6 +37,10 @@ BotHeatImpl::BotHeatImpl(BotHeatOptions const& options_, torch::nn::Module* p)
 
 void BotHeatImpl::reset() {
   TORCH_CHECK(phydro, "[BotHeat] Parent Hydro is null");
+  TORCH_CHECK(!(phydro->pmb && phydro->pmb->pcoord &&
+                phydro->pmb->pcoord->options->stretched_x1()),
+              "[BotHeat] not supported on a stretched x1 (geometry/x1f or "
+              "cells/x1rat, #280)");
 }
 
 torch::Tensor BotHeatImpl::forward(torch::Tensor du, torch::Tensor w,

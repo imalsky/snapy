@@ -103,6 +103,6 @@ namespace snap {
 std::tuple<torch::Tensor, double, int> balance_column(
     torch::Tensor const& w, torch::Tensor const& dx1f, double grav,
     bool wall_clamp = true, double rtol = 1.e-10, int max_iter = 120,
-    std::string const& geometry = "");
+    std::string const& geometry = "", bool stretched = false);
 
 }  // namespace snap

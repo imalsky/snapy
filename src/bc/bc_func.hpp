@@ -37,3 +37,4 @@ struct BCRegistrar {
 // Face classification also works for programmatically selected built-in
 // callbacks.
 bool is_outflow(bcfunc_t const& func);
+bool is_reflecting(bcfunc_t const& func);

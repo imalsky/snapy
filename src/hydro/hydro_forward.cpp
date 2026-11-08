@@ -361,6 +361,7 @@ torch::Tensor HydroImpl::forward(double dt, torch::Tensor u,
   enum { DIM1 = 3, DIM2 = 2, DIM3 = 1 };
   bool has_solid = other.count("solid");
   auto start = std::chrono::high_resolution_clock::now();
+  _check_stretched_x1(u);
 
   auto playout = pmb->get_layout();
   for (int k = 0; k < 2; ++k) {
@@ -1082,6 +1083,11 @@ torch::Tensor HydroImpl::forward(double dt, torch::Tensor u,
     auto type1 = precon1->pinterp1->options->type();
     if (!gw_cell && !radial_exact &&
         (type1 == "cp3" || type1 == "cp5" || type1 == "weno5")) {
+      TORCH_CHECK(!pmb->pcoord->options->stretched_x1(),
+                  "the dx^2/12 x1 curvature correction of cp3/cp5/weno5 is "
+                  "not supported on a stretched x1 (#280); use gravity-work: "
+                  "face with SNAP_GRAVITY_WORK_RADIAL_EXACT on (the default) "
+                  "or gravity-work: cell");
       int n = ie - is;
       auto x1v = pmb->pcoord->x1v;
       auto rhov = w[IDN] * w[IVX];

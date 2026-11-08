@@ -22,10 +22,23 @@ void CartesianImpl::reset() {
   // dimension 1
   // Global cell width, not this block's own; see dx1() in coordinate.hpp.
   auto dx = op->dx1();
-  dx1f = register_buffer("dx1f", torch::ones(op->nc1(), torch::kFloat64) * dx);
-  x1v = register_buffer("x1v", 0.5 * (x1f.slice(0, 0, op->nc1()) +
-                                      x1f.slice(0, 1, op->nc1() + 1)));
-  dx1v = register_buffer("dx1v", torch::ones(op->nc1(), torch::kFloat64) * dx);
+  if (op->stretched_x1()) {
+    int n = op->nc1();
+    auto fe = op->global_x1f().narrow(
+        0, op->ix1() - op->nghost() + op->x1f_ghosts() - 1, n + 3);
+    auto ve = 0.5 * (fe.slice(0, 0, n + 2) + fe.slice(0, 1, n + 3));
+    dx1f = register_buffer("dx1f", x1f.slice(0, 1, n + 1) - x1f.slice(0, 0, n));
+    x1v = register_buffer("x1v",
+                          0.5 * (x1f.slice(0, 0, n) + x1f.slice(0, 1, n + 1)));
+    dx1v = register_buffer("dx1v", ve.slice(0, 1, n + 1) - ve.slice(0, 0, n));
+  } else {
+    dx1f =
+        register_buffer("dx1f", torch::ones(op->nc1(), torch::kFloat64) * dx);
+    x1v = register_buffer("x1v", 0.5 * (x1f.slice(0, 0, op->nc1()) +
+                                        x1f.slice(0, 1, op->nc1() + 1)));
+    dx1v =
+        register_buffer("dx1v", torch::ones(op->nc1(), torch::kFloat64) * dx);
+  }
 
   // dimension 2
   dx = op->dx2();

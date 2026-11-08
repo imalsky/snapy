@@ -36,6 +36,13 @@ void ScalarImpl::reset() {
 
   pcoord = pmb->pcoord;
   precon = ReconstructImpl::create(options->recon(), this);
+
+  if (pcoord && pcoord->options->stretched_x1()) {
+    precon1 = ReconstructImpl::create(options->recon(), this, "recon1");
+    precon1->set_x1_faces(pcoord->x1f);
+  } else {
+    precon1 = precon;
+  }
   priemann = RiemannSolverImpl::create(options->riemann(), this);
 
   if (options->thermo()) {
@@ -103,7 +110,14 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
   };
 
   if (_flux1.defined()) {
-    if (weno5) {
+    // A stretched x1 grid reconstructs with per-face rows (precon1), which
+    // the fused kernel does not read.
+    bool fused_x1 = weno5 && precon1.ptr() == precon.ptr();
+    if (weno5 && !fused_x1)
+      TORCH_WARN_ONCE(
+          "SNAP_SCALAR_FUSED=1: x1 runs the default path on a stretched x1 "
+          "grid");
+    if (fused_x1) {
       auto rc = r.contiguous();
       auto flux = torch::empty_like(rc);
       at::native::call_scalar_weno5(flux.device().type(), flux, rc, weno5->cm,
@@ -111,7 +125,7 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
                                     pmb->phydro->flux1()[IDN].contiguous());
       _flux1.set_(flux);
     } else {
-      auto rlr = precon->forward(r, DIM1);
+      auto rlr = precon1->forward(r, DIM1);
       _flux1.set_(priemann->forward(rlr[ILT], rlr[IRT], DIM1,
                                     pmb->phydro->flux1()[IDN]));
     }

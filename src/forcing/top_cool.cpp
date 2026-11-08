@@ -37,6 +37,10 @@ TopCoolImpl::TopCoolImpl(TopCoolOptions const& options_, torch::nn::Module* p)
 
 void TopCoolImpl::reset() {
   TORCH_CHECK(phydro, "[TopCool] Parent Hydro is null");
+  TORCH_CHECK(!(phydro->pmb && phydro->pmb->pcoord &&
+                phydro->pmb->pcoord->options->stretched_x1()),
+              "[TopCool] not supported on a stretched x1 (geometry/x1f or "
+              "cells/x1rat, #280)");
 }
 
 torch::Tensor TopCoolImpl::forward(torch::Tensor du, torch::Tensor w,

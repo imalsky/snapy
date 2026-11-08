@@ -148,7 +148,8 @@ void initialize_block(MeshBlock block, Variables& vars,
       break;
     }
     if (i < iu) {
-      dz = pcoord->dx1f[i].item<double>();
+      // step centre i -> i+1 by the centre spacing, not the cell width
+      dz = pcoord->dx1v[i + 1].item<double>();
       thermo_x->extrapolate_dz(
           temp, pres, xfrac,
           kintera::ExtrapOptions().dz(dz).grav(grav).ds_dz(0.).rainout(true));
@@ -156,7 +157,7 @@ void initialize_block(MeshBlock block, Variables& vars,
   }
 
   for (; i <= iu; ++i) {
-    dz = pcoord->dx1f[i].item<double>();
+    dz = pcoord->dx1v[i].item<double>();  // centre i-1 -> i
     auto mu = (thermo_x->mu * xfrac).sum(-1);
     pres *= torch::exp(-grav * mu * dz / (kintera::constants::Rgas * temp));
     auto conc = thermo_x->compute("TPX->V", {temp, pres, xfrac});

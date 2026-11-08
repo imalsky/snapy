@@ -92,6 +92,8 @@ class ReconstructImpl : public torch::nn::Cloneable<ReconstructImpl> {
                            torch::nn::Module* p = nullptr);
   void reset() override;
 
+  void set_x1_faces(torch::Tensor const& x1f);
+
   //! w -> [wl, wr]
   // floor=false skips the reconstruction-stage density/pressure floors (the
   // caller reconstructs perturbation variables that are legitimately

@@ -209,7 +209,8 @@ double project(MeshBlock block, torch::Tensor w, double grav, int* sweeps) {
   double residual;
   std::tie(balanced, residual, *sweeps) =
       balance_column(wi.contiguous(), dx, grav, /*wall_clamp=*/true,
-                     kBalanceRtol, /*max_iter=*/400, pcoord->options->type());
+                     kBalanceRtol, /*max_iter=*/400, pcoord->options->type(),
+                     pcoord->options->stretched_x1());
   wi.copy_(balanced);
   return residual;
 }
@@ -318,7 +319,8 @@ void initialize_block(MeshBlock block, Variables& vars,
     xfrac_state.select(2, i).copy_(xfrac);
 
     if (i < iu) {
-      dz = pcoord->dx1f[i].item<double>();
+      // step centre i -> i+1 by the centre spacing, not the cell width
+      dz = pcoord->dx1v[i + 1].item<double>();
       thermo_x->extrapolate_dz(
           temp, pres, xfrac,
           kintera::ExtrapOptions().dz(dz).grav(grav).ds_dz(0.).rainout(false));

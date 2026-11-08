@@ -277,9 +277,10 @@ class HydroImpl : public torch::nn::Cloneable<HydroImpl> {
   //! Register all forcing modules
   std::vector<std::string> _register_forcings_module();
 
-  //! x1 grid uniformity (-1 unknown, 0 non-uniform, 1 uniform), probed once;
-  //! selects the six-face vs log-mean cell-pressure reference
   mutable int x1_uniform_ = -1;
+  mutable torch::Tensor x1_rows_;
+
+  void _check_stretched_x1(torch::Tensor const& u) const;
   //! SNAP_WB_REF4 stencils for this block's x1 grid, built on first use
   mutable std::shared_ptr<WbRef4Stencils> wb_ref4_;
   //! SNAP_X1_CENTROID_EXACT r^2 -> plain-mean stencils, built on first use
