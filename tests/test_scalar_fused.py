@@ -17,6 +17,8 @@ near-cancellation of front-sized terms); with PLM (no WENO5 kernel, every other 
   box_plm      the box with PLM
   box_dry_plm  the box with PLM and a stage forcing that adds and removes dry mass (both arms of the
                scalars' dry-source carry)
+  box_x1rat    the box on a stretched x1 grid (x1rat 1.1): x1 has per-face rows, which the fused kernel does not
+               read, so x1 must take the default path
 The positivity limiter must act (cells with theta < 1) in the PLM cases, the same cells on both paths.
 
   python test_scalar_fused.py
@@ -50,7 +52,17 @@ class _DrySource(torch.nn.Module):
 
 
 NSTEP, NVAR, TOL, RAD = 4, 6, 1.0e-12, 4
-CASES = ("sphere", "sphere_cov0", "sphere_ub", "sphere_plm", "sphere_cov0_plm", "box", "box_plm", "box_dry_plm")
+CASES = (
+    "sphere",
+    "sphere_cov0",
+    "sphere_ub",
+    "sphere_plm",
+    "sphere_cov0_plm",
+    "box",
+    "box_plm",
+    "box_dry_plm",
+    "box_x1rat",
+)
 
 
 def config(case):
@@ -121,6 +133,8 @@ def config(case):
         cfg["forcing"]["coriolis"] = {"type": "xyz", "omega1": 2.2e-6}
     if case == "sphere_ub":
         cfg["scalar"]["upper-bound"] = 1.0
+    if case == "box_x1rat":
+        cfg["geometry"]["cells"]["x1rat"] = 1.1
     if case.endswith("_plm"):
         cfg["scalar"]["reconstruct"] = {"type": "plm", "scale": False, "shock": True}
     return cfg
