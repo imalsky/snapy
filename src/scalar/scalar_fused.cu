@@ -603,9 +603,8 @@ void scalar_implicit_transfer_cuda(torch::Tensor& ds, torch::Tensor const& s,
   AT_DISPATCH_FLOATING_TYPES(r.scalar_type(), "scalar_transfer_faces", [&] {
     scalar_transfer_faces_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
         P.data_ptr<scalar_t>(), held.data_ptr<scalar_t>(),
-        s.data_ptr<scalar_t>(), ds.data_ptr<scalar_t>(),
-        r.data_ptr<scalar_t>(), m.data_ptr<scalar_t>(),
-        vol.data_ptr<scalar_t>(), n1, m.numel(), total);
+        s.data_ptr<scalar_t>(), ds.data_ptr<scalar_t>(), r.data_ptr<scalar_t>(),
+        m.data_ptr<scalar_t>(), vol.data_ptr<scalar_t>(), n1, m.numel(), total);
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   // the default path's own column sweep (implicit_dispatch.cu)

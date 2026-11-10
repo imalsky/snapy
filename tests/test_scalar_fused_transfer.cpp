@@ -70,9 +70,8 @@ TEST(scalar_fused, implicit_transfer_matches_libtorch_bitwise) {
   torch::Tensor P;
   auto want = reference(ds, s, r, M, vol, il, iu, &P);
   auto got = ds.clone();
-  at::native::call_scalar_implicit_transfer(dev.type(), got, s, r,
-                                            M.contiguous(),
-                                            vol.contiguous(), il, iu);
+  at::native::call_scalar_implicit_transfer(
+      dev.type(), got, s, r, M.contiguous(), vol.contiguous(), il, iu);
   EXPECT_TRUE(same_bits(want, got));
 
   // the cap must have bound on some faces, or this compares nothing new

@@ -195,9 +195,9 @@ TEST(scalar_fused, weno5_refuses_other_tables) {
     auto cp = weno5->cp.clone();
     (right ? cp : cm)[0][2] += 0.125;
     auto faces = torch::empty({2, NVAR, 3, 2, 20}, w.options());
-    EXPECT_THROW(at::native::call_scalar_weno5(dev.type(), faces, w, cm, cp,
-                                               true, 3),
-                 c10::Error)
+    EXPECT_THROW(
+        at::native::call_scalar_weno5(dev.type(), faces, w, cm, cp, true, 3),
+        c10::Error)
         << (right ? "cp" : "cm") << " changed, face states";
   }
 }
