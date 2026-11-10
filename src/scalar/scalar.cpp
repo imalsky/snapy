@@ -223,14 +223,18 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
 
   if (_flux2.defined()) {
     _flux2.set_(lateral(rtmp2, DIM2, pmb->phydro->flux2()[IDN]));
-    rtmp2 = torch::Tensor();  // the face states and their exchange views
-    send_vars2.clear();
+    if (fused) {  // the face states and their exchange views, freed early
+      rtmp2 = torch::Tensor();
+      send_vars2.clear();
+    }
   }
 
   if (_flux3.defined()) {
     _flux3.set_(lateral(rtmp3, DIM3, pmb->phydro->flux3()[IDN]));
-    rtmp3 = torch::Tensor();
-    send_vars3.clear();
+    if (fused) {
+      rtmp3 = torch::Tensor();
+      send_vars3.clear();
+    }
   }
 
   // Tracer flux positivity limiter: same scheme (and same rationale) as the
