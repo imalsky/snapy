@@ -3,8 +3,6 @@
 #include <initializer_list>
 #include <limits>
 #include <mutex>
-#include <set>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -48,19 +46,42 @@ int64_t flat_blocks(int64_t total, int threads, char const* who) {
 // The fused WENO5 kernels write out the uniform-grid tables of
 // Weno5InterpImpl (wenol0 ... below): cm for the left face and its mirror cp
 // for the right. Any other table is refused. The check compares in the
-// table's own dtype (as the kernels' T(...) constants round) and runs once per
-// table state (data pointers, version counters and dtype; one copy each to the
-// host).
+// table's own dtype (as the kernels' T(...) constants round), one copy of each
+// table to the host. It runs once per table state: the tensors (held by weak
+// references, so a freed table's entry expires and a new table at a reused
+// address is checked again), their data pointers and version counters.
+// Inference tensors have no version counter: they are checked on every call.
+struct ValidatedTables {
+  c10::weak_intrusive_ptr<c10::TensorImpl, c10::UndefinedTensorImpl> cm, cp;
+  void const* cm_data;
+  void const* cp_data;
+  int64_t cm_version, cp_version;
+};
+
+bool is_state_of(ValidatedTables const& v, torch::Tensor const& cm,
+                 torch::Tensor const& cp) {
+  auto a = v.cm.lock(), b = v.cp.lock();
+  return a.defined() && b.defined() && a.get() == cm.unsafeGetTensorImpl() &&
+         b.get() == cp.unsafeGetTensorImpl() && v.cm_data == cm.data_ptr() &&
+         v.cp_data == cp.data_ptr() && v.cm_version == cm._version() &&
+         v.cp_version == cp._version();
+}
+
 void check_uniform_weno5(torch::Tensor const& cm, torch::Tensor const& cp,
                          char const* who) {
   static std::mutex mu;
-  using Key = std::tuple<void const*, int64_t, void const*, int64_t, int>;
-  static std::set<Key> seen;
-  Key key{cm.data_ptr(), static_cast<int64_t>(cm._version()), cp.data_ptr(),
-          static_cast<int64_t>(cp._version()),
-          static_cast<int>(cm.scalar_type())};
+  static std::vector<ValidatedTables> seen;
+  bool cache = !cm.is_inference() && !cp.is_inference();
   std::lock_guard<std::mutex> lock(mu);
-  if (seen.count(key)) return;
+  if (cache) {
+    for (auto const& v : seen)
+      if (is_state_of(v, cm, cp)) return;
+    seen.erase(std::remove_if(seen.begin(), seen.end(),
+                              [](ValidatedTables const& v) {
+                                return v.cm.expired() || v.cp.expired();
+                              }),
+               seen.end());
+  }
   static double const table[45] = {
       -1. / 6., 5. / 6., 1. / 3., 0.,  0.,       0.,       1. / 3., 5. / 6.,
       -1. / 6., 0.,      0.,      0.,  11. / 6., -7. / 6., 1. / 3., 1.,
@@ -77,7 +98,13 @@ void check_uniform_weno5(torch::Tensor const& cm, torch::Tensor const& cp,
               who,
               ": the fused path writes out the uniform-grid WENO5 tables; "
               "this reconstruction uses other ones");
-  seen.insert(key);
+  if (cache)
+    seen.push_back(
+        {c10::weak_intrusive_ptr<c10::TensorImpl, c10::UndefinedTensorImpl>(
+             cm.getIntrusivePtr()),
+         c10::weak_intrusive_ptr<c10::TensorImpl, c10::UndefinedTensorImpl>(
+             cp.getIntrusivePtr()),
+         cm.data_ptr(), cp.data_ptr(), cm._version(), cp._version()});
 }
 }  // namespace
 

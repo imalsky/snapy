@@ -201,3 +201,66 @@ TEST(scalar_fused, weno5_refuses_other_tables) {
         << (right ? "cp" : "cm") << " changed, face states";
   }
 }
+
+// A validated table is remembered while its tensors live, not by address: a
+// table freed after its check and another table copied to the reused
+// allocation (same data pointers and version counters) must be checked again
+// and refused.
+TEST(scalar_fused, weno5_rechecks_a_table_at_a_reused_address) {
+  if (!snapy_cuda_test_enabled()) {
+    GTEST_SKIP() << "no CUDA device";
+  }
+  torch::Device dev(torch::kCUDA, 0);
+  auto rec = make_rec(true, dev, torch::kFloat64);
+  auto weno5 = std::dynamic_pointer_cast<Weno5InterpImpl>(rec->pinterp1);
+  ASSERT_TRUE(weno5);
+  auto w = make_lines(20, 3).to(dev);
+  auto faces = torch::empty({2, NVAR, 3, 2, 20}, w.options());
+  auto cm_host = weno5->cm.cpu(), cp_host = weno5->cp.cpu();
+  void const* cm_data = nullptr;
+  void const* cp_data = nullptr;
+  int64_t cm_version = -1, cp_version = -1;
+  {
+    auto cm = cm_host.to(dev), cp = cp_host.to(dev);
+    at::native::call_scalar_weno5(dev.type(), faces, w, cm, cp, true, 3);
+    cm_data = cm.data_ptr();
+    cp_data = cp.data_ptr();
+    cm_version = cm._version();
+    cp_version = cp._version();
+  }
+  auto bad = cm_host.clone();
+  bad[0][2] += 0.125;
+  auto cm = bad.to(dev), cp = cp_host.to(dev);
+  // the case to test: the freed allocations and version counters come back
+  ASSERT_EQ(cm.data_ptr(), cm_data);
+  ASSERT_EQ(cp.data_ptr(), cp_data);
+  ASSERT_EQ(cm._version(), cm_version);
+  ASSERT_EQ(cp._version(), cp_version);
+  EXPECT_THROW(
+      at::native::call_scalar_weno5(dev.type(), faces, w, cm, cp, true, 3),
+      c10::Error);
+}
+
+// Tables made under inference mode have no version counter: they are checked
+// on every call, so the uniform table runs and a changed one is refused.
+TEST(scalar_fused, weno5_checks_inference_tables) {
+  if (!snapy_cuda_test_enabled()) {
+    GTEST_SKIP() << "no CUDA device";
+  }
+  torch::Device dev(torch::kCUDA, 0);
+  auto rec = make_rec(true, dev, torch::kFloat64);
+  auto weno5 = std::dynamic_pointer_cast<Weno5InterpImpl>(rec->pinterp1);
+  ASSERT_TRUE(weno5);
+  c10::InferenceMode guard;
+  auto w = make_lines(20, 3).to(dev);
+  auto faces = torch::empty({2, NVAR, 3, 2, 20}, w.options());
+  auto cm = weno5->cm.clone(), cp = weno5->cp.clone();
+  ASSERT_TRUE(cm.is_inference() && cp.is_inference());
+  for (int k = 0; k < 2; ++k)
+    EXPECT_NO_THROW(
+        at::native::call_scalar_weno5(dev.type(), faces, w, cm, cp, true, 3));
+  cm[0][2] += 0.125;  // in place: an inference tensor has no version to bump
+  EXPECT_THROW(
+      at::native::call_scalar_weno5(dev.type(), faces, w, cm, cp, true, 3),
+      c10::Error);
+}
