@@ -33,10 +33,9 @@ ScalarOptions ScalarOptionsImpl::from_yaml(std::string const& filename,
   if (node["reconstruct"]) {
     op->recon() = ReconstructOptionsImpl::create();
     auto recon = node["reconstruct"];
-    check_keys(recon, "scalar/reconstruct", {"shock", "type", "scale"});
+    check_keys(recon, "scalar/reconstruct", {"shock", "type"});
     op->recon()->shock() = recon["shock"].as<bool>(false);
     op->recon()->interp()->type() = recon["type"].as<std::string>("dc");
-    op->recon()->interp()->scale() = recon["scale"].as<bool>(false);
   } else {
     op->recon() = nullptr;
   }

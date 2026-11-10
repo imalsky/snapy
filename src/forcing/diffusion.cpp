@@ -78,6 +78,14 @@ torch::Tensor centered_derivative(torch::Tensor value, Coordinate const& coord,
   ++upper[dim];
   --lower[dim];
   --lower_end[dim];
+  // #280, a stretched x1: over the distance between the two centres
+  if (idir == 0 && coord->options->stretched_x1()) {
+    auto x1v = coord->x1v.view({1, 1, -1});
+    return (region_slice(value, upper_start, upper) -
+            region_slice(value, lower, lower_end)) /
+           (spacing_slice(x1v, idir, upper_start, upper) -
+            spacing_slice(x1v, idir, lower, lower_end));
+  }
   return (region_slice(value, upper_start, upper) -
           region_slice(value, lower, lower_end)) /
          (2. * spacing_slice(cell_width(coord, idir), idir, start, end));
@@ -96,15 +104,32 @@ torch::Tensor face_normal_derivative(torch::Tensor value,
          spacing_slice(center_distance(coord, idir), idir, start, end);
 }
 
-torch::Tensor face_average(torch::Tensor value, int idir, Region start,
-                           Region end) {
+torch::Tensor face_mean(torch::Tensor below, torch::Tensor above,
+                        Coordinate const& coord, int idir, Region start,
+                        Region end) {
+  // #280, a stretched x1: distance-weighted, as rf in hydro_dispatch.cpp
+  if (idir == 0 && coord->options->stretched_x1()) {
+    auto lower = start;
+    auto lower_end = end;
+    --lower[kSpatialDims[idir] - 1];
+    --lower_end[kSpatialDims[idir] - 1];
+    auto width = cell_width(coord, idir);
+    auto hd = spacing_slice(width, idir, lower, lower_end);
+    auto hu = spacing_slice(width, idir, start, end);
+    return (hu * below + hd * above) / (hd + hu);
+  }
+  return 0.5 * (above + below);
+}
+
+torch::Tensor face_average(torch::Tensor value, Coordinate const& coord,
+                           int idir, Region start, Region end) {
   auto dim = kSpatialDims[idir] - 1;
   auto lower = start;
   auto lower_end = end;
   --lower[dim];
   --lower_end[dim];
-  return 0.5 * (region_slice(value, start, end) +
-                region_slice(value, lower, lower_end));
+  return face_mean(region_slice(value, lower, lower_end),
+                   region_slice(value, start, end), coord, idir, start, end);
 }
 
 //! Linear extrapolation of `value` onto a physical wall face from the two
@@ -142,7 +167,7 @@ torch::Tensor extrapolate_to_wall(torch::Tensor value, Coordinate const& coord,
 torch::Tensor face_coefficient(torch::Tensor value, Coordinate const& coord,
                                int idir, Region start, Region end,
                                bool wall_lower, bool wall_upper) {
-  auto out = face_average(value, idir, start, end);
+  auto out = face_average(value, coord, idir, start, end);
   auto dim = kSpatialDims[idir] - 1;
   auto nface = end[dim] - start[dim];
   if (nface < 3) return out;  // fewer than two active cells to extrapolate from
@@ -175,7 +200,7 @@ torch::Tensor face_scaled_coefficient(torch::Tensor value, torch::Tensor scale,
   }
   // x2/x3 faces: both cells share the x1 profile, so the mean of the products
   // equals the product of the means; keep that form, bitwise as before
-  auto out = face_average(value, idir, start, end) *
+  auto out = face_average(value, coord, idir, start, end) *
              scale.slice(0, start[2], end[2]).view({1, 1, -1});
   auto dim = kSpatialDims[idir] - 1;
   auto nface = end[dim] - start[dim];
@@ -347,9 +372,6 @@ void DiffusionImpl::reset() {
 
   auto coord = phydro->pmb->pcoord;
   auto enabled = options->nu_iso() > 0. || options->kappa_iso() > 0.;
-  TORCH_CHECK(!enabled || !coord->options->stretched_x1(),
-              "[Diffusion] not supported on a stretched x1 (geometry/x1f or "
-              "cells/x1rat, #280): its x1 differences assume uniform cells");
   bool spherical = coord->options->type() == "gnomonic-equiangle";
   TORCH_CHECK(!options->implicit_radial() ||
                   (spherical && phydro->peos->options->type() == "ideal-gas"),
@@ -578,7 +600,7 @@ torch::Tensor DiffusionImpl::forward(torch::Tensor du, torch::Tensor w,
     }
 
     if (options->nu_iso() > 0.) {
-      auto div_face = face_average(div_vel, idir, face_start, face_end);
+      auto div_face = face_average(div_vel, coord, idir, face_start, face_end);
       for (int ivar = 0; ivar < 3; ++ivar) {
         auto stress = face_normal_derivative(w[IVX + ivar], coord, idir,
                                              face_start, face_end);
@@ -589,10 +611,11 @@ torch::Tensor DiffusionImpl::forward(torch::Tensor du, torch::Tensor w,
           auto shear_end = face_end;
           --shear_start[dim];
           --shear_end[dim];
-          stress += 0.5 * (centered_derivative(w[IVX + idir], coord, ivar,
-                                               face_start, face_end) +
-                           centered_derivative(w[IVX + idir], coord, ivar,
-                                               shear_start, shear_end));
+          stress += face_mean(centered_derivative(w[IVX + idir], coord, ivar,
+                                                  shear_start, shear_end),
+                              centered_derivative(w[IVX + idir], coord, ivar,
+                                                  face_start, face_end),
+                              coord, idir, face_start, face_end);
         }
 
         auto momentum_flux = options->dynamic()
@@ -600,7 +623,7 @@ torch::Tensor DiffusionImpl::forward(torch::Tensor du, torch::Tensor w,
                                  : -options->nu_iso() * rho_face * stress;
         flux[IVX + ivar].index(face_index).copy_(momentum_flux);
         flux[IPR].index(face_index) +=
-            face_average(w[IVX + ivar], idir, face_start, face_end) *
+            face_average(w[IVX + ivar], coord, idir, face_start, face_end) *
             momentum_flux;
       }
     }

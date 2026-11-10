@@ -43,7 +43,7 @@ geometry:
 scalar:
   nvar: 1
   names: [tracer]
-  reconstruct: {type: weno5, scale: false, shock: false}
+  reconstruct: {type: weno5, shock: false}
 integration:
   type: rk3
   cfl: 0.4

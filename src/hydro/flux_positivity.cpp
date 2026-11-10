@@ -77,6 +77,16 @@ torch::Tensor flux_positivity_theta(torch::Tensor const& u,
                       torch::ones_like(u));
 }
 
+torch::Tensor flux_positivity_share(torch::Tensor const& q) {
+  auto low = torch::minimum(q.roll(1, 3), q.roll(-1, 3));
+  for (int dim : {2, 1}) {
+    if (q.size(dim) > 1)
+      low =
+          torch::minimum(low, torch::minimum(q.roll(1, dim), q.roll(-1, dim)));
+  }
+  return torch::where(q > 0., (low / q).clamp(0., 1.), torch::zeros_like(q));
+}
+
 void flux_positivity_scale_(torch::Tensor const& theta,
                             torch::Tensor const& flux1,
                             torch::Tensor const& flux2,

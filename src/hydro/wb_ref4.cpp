@@ -2,7 +2,6 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <cmath>
 #include <vector>
 
 // snap
@@ -38,14 +37,6 @@ double lagrange_deriv(std::vector<double> const& X, int j, double x) {
     sum += prod;
   }
   return sum;
-}
-
-double lagrange(std::vector<double> const& X, int j, double x) {
-  double prod = 1.;
-  for (int m = 0; m < (int)X.size(); ++m) {
-    if (m != j) prod *= (x - X[m]) / (X[j] - X[m]);
-  }
-  return prod;
 }
 
 torch::Tensor to_index(std::vector<std::vector<int64_t>> const& rows, int k) {
@@ -95,7 +86,7 @@ bool wb_ref4_enabled() {
 }
 
 WbRef4Stencils wb_ref4_stencils(torch::Tensor const& x1f, int is, int iu,
-                                bool uniform, bool clamp_in, bool clamp_out,
+                                bool clamp_in, bool clamp_out,
                                 torch::TensorOptions const& options) {
   WbRef4Stencils st;
   auto xt = x1f.to(torch::kCPU, torch::kFloat64).contiguous();
@@ -106,7 +97,6 @@ WbRef4Stencils wb_ref4_stencils(torch::Tensor const& x1f, int is, int iu,
   st.is = is;
   st.iu = iu;
   st.nc1 = nc1;
-  st.uniform = uniform;
   st.clamp_in = clamp_in;
   st.clamp_out = clamp_out;
   // the clamped stencils need four owned cells next to the wall; a block
@@ -162,37 +152,7 @@ WbRef4Stencils wb_ref4_stencils(torch::Tensor const& x1f, int is, int iu,
   st.fwt = to_weight(fw, kf).to(options);
   st.nidx = to_index(ni, 3).to(options.device());
 
-  // 2. non-uniform cell pressure: the cell average (three-point
-  //    Gauss-Legendre, exact for a cubic) of the cubic through the face
-  //    pressures at faces i-1..i+2, window inside the owned faces at a clamped
-  //    wall
-  if (!uniform) {
-    std::vector<std::vector<int64_t>> pi;
-    std::vector<std::vector<double>> pw;
-    double gx[3] = {-std::sqrt(0.6), 0., std::sqrt(0.6)};
-    double gw[3] = {5. / 18., 8. / 18., 5. / 18.};
-    for (int i = is; i <= iu; ++i) {
-      int s = i - 1;
-      if (clamp_in) s = std::max(s, is);
-      if (clamp_out) s = std::min(s, iu + 1 - 3);
-      s = clampi(s, 0, nc1 + 1 - 4);
-      double c = 0.5 * (xf[i] + xf[i + 1]), h = 0.5 * (xf[i + 1] - xf[i]);
-      std::vector<double> X(4);
-      for (int k = 0; k < 4; ++k) X[k] = xf[s + k] - c;
-      std::vector<int64_t> idx(4);
-      std::vector<double> wt(4, 0.);
-      for (int k = 0; k < 4; ++k) {
-        idx[k] = s + k;
-        for (int q = 0; q < 3; ++q) wt[k] += gw[q] * lagrange(X, k, gx[q] * h);
-      }
-      pi.push_back(idx);
-      pw.push_back(wt);
-    }
-    st.pidx = to_index(pi, 4).to(options.device());
-    st.pwt = to_weight(pw, 4).to(options);
-  }
-
-  // 3. face density at faces is..iu+1: P'(x_f), P the quartic through the
+  // 2. face density at faces is..iu+1: P'(x_f), P the quartic through the
   //    primitive P(x_{s+j}) = sum_{k<j} d_{s+k} dz_{s+k}, j = 0..4, window
   //    s = f-2 kept inside the owned cells at a clamped wall. The weight of
   //    cell s+k is dz_{s+k} sum_{j>k} L_j'(x_f). Uniform interior:
@@ -244,20 +204,8 @@ torch::Tensor wb_ref4_cells(WbRef4Stencils const& st, torch::Tensor const& w,
 
   int nown = st.iu - st.is + 1;
   auto fl = flag.narrow(-1, st.is, nown);
-  auto p_old = pref.narrow(-1, st.is, nown).clone();
   auto d_old = dref.narrow(-1, st.is, nown).clone();
 
-  // non-uniform x1: fourth-order cell pressure, inside the kernel's
-  // [min, max] guard of the cell's two face pressures
-  if (!st.uniform) {
-    auto pface = torch::cat({psf_lo, psf_hi.narrow(-1, st.nc1 - 1, 1)}, -1);
-    auto pnew = apply(pface, st.pidx, st.pwt);
-    auto lo = psf_lo.narrow(-1, st.is, nown),
-         hi = psf_hi.narrow(-1, st.is, nown);
-    auto ok = ~fl & (pnew >= torch::minimum(lo, hi)) &
-              (pnew <= torch::maximum(lo, hi));
-    pref.narrow(-1, st.is, nown).copy_(torch::where(ok, pnew, p_old));
-  }
   auto p_new = pref.narrow(-1, st.is, nown);
 
   // dref = pref * F(rho/p); outside the range of rho/p over cells i-1..i+1
@@ -267,9 +215,8 @@ torch::Tensor wb_ref4_cells(WbRef4Stencils const& st, torch::Tensor const& w,
   auto nb = r.index_select(-1, st.nidx.flatten())
                 .view({r.size(0), r.size(1), nown, 3});
   auto ok = in_range(fr, std::get<0>(nb.min(-1)), std::get<0>(nb.max(-1)));
-  auto keep = st.uniform ? d_old : p_new * (d_old / p_old);
   dref.narrow(-1, st.is, nown)
-      .copy_(torch::where(fl, d_old, torch::where(ok, p_new * fr, keep)));
+      .copy_(torch::where(fl, d_old, torch::where(ok, p_new * fr, d_old)));
   return flag;
 }
 

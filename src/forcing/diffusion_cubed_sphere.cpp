@@ -1,9 +1,11 @@
 // Conservative physical diffusion on a nonorthogonal cubed sphere.
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <snap/coord/coord_utils.hpp>
 #include <snap/coord/cubed_sphere_utils.hpp>
 #include <snap/mesh/meshblock.hpp>
+#include <vector>
 
 #include "forcing.hpp"
 
@@ -34,8 +36,21 @@ std::array<Tensor, 3> basis(Tensor a, Tensor b, Tensor r, int panel) {
 struct Stencil {
   Tensor indices, values;
 };
-Stencil weights(int n, bool faces, bool derivative, double h, Tensor like) {
+// With nodes, the weights are in those positions (cell centres) and evaluated
+// at `at` (faces or centres): a stretched x1 (#280), h = 1.
+Stencil weights(int n, bool faces, bool derivative, double h, Tensor like,
+                Tensor nodes = Tensor(), Tensor at = Tensor()) {
   TORCH_CHECK(n >= 4, "Cubed-sphere diffusion needs four stencil cells.");
+  std::vector<double> x(n), t(n + (faces ? 1 : 0));
+  for (int k = 0; k < n; ++k) x[k] = k;
+  for (int k = 0; k < static_cast<int>(t.size()); ++k)
+    t[k] = k - (faces ? 0.5 : 0.);
+  if (nodes.defined()) {
+    auto xn = nodes.to(torch::kCPU, torch::kFloat64).contiguous();
+    auto tn = at.to(torch::kCPU, torch::kFloat64).contiguous();
+    std::copy_n(xn.data_ptr<double>(), x.size(), x.begin());
+    std::copy_n(tn.data_ptr<double>(), t.size(), t.begin());
+  }
   int rows = n + (faces ? 1 : 0);
   auto w = torch::empty({4, rows}, torch::kFloat64);
   auto indices = torch::empty({4, rows}, torch::kInt64);
@@ -46,17 +61,17 @@ Stencil weights(int n, bool faces, bool derivative, double h, Tensor like) {
     int start =
         std::max(0, std::min(n - 4, static_cast<int>(std::floor(q)) - 1));
     for (int j = start; j < start + 4; ++j) {
-      double value = 0.;
+      double value = 0., s = t[row];
       if (!derivative) {
         value = 1.;
         for (int k = start; k < start + 4; ++k)
-          if (k != j) value *= (q - k) / (j - k);
+          if (k != j) value *= (s - x[k]) / (x[j] - x[k]);
       } else
         for (int k = start; k < start + 4; ++k)
           if (k != j) {
-            double term = 1. / (j - k);
+            double term = 1. / (x[j] - x[k]);
             for (int l = start; l < start + 4; ++l)
-              if (l != j && l != k) term *= (q - l) / (j - l);
+              if (l != j && l != k) term *= (s - x[l]) / (x[j] - x[l]);
             value += term / h;
           }
       ptr[j - start][row] = value;
@@ -189,20 +204,23 @@ Tensor DiffusionImpl::forward_cubed_sphere(Tensor du, Tensor w, Tensor temp,
   mu = Tensor();
   k = Tensor();
   std::array<double, 3> h{op->dx1(), op->dx2(), op->dx3()};
+  // x1 stencils on the actual radii when x1 is stretched (#280)
+  auto stencil = [&](int j, bool faces, bool derivative) {
+    int m = hi[2 - j] - lo[2 - j];
+    if (j || !op->stretched_x1()) return weights(m, faces, derivative, h[j], w);
+    auto xv = c->x1v.slice(0, lo[2], hi[2]);
+    return weights(m, faces, derivative, 1., w, xv,
+                   faces ? c->x1f.slice(0, lo[2], hi[2] + 1) : xv);
+  };
   std::array<Tensor, 3> flux;
   std::array<Tensor, 4> trace, normals;
   for (int dir = 0; dir < 3; ++dir) {
     int dim = 2 - dir, axis = dim - 3, n = hi[dim] - lo[dim];
-    auto interp = weights(n, true, false, h[dir], w);
-    auto face = transform(cells, interp, axis);
+    auto face = transform(cells, stencil(dir, true, false), axis);
     std::array<Tensor, 3> deriv;
     for (int j = 0; j < 3; ++j) {
-      deriv[j] =
-          j == dir
-              ? transform(cells, weights(n, true, true, h[j], w), axis)
-              : transform(face,
-                          weights(hi[2 - j] - lo[2 - j], false, true, h[j], w),
-                          -1 - j);
+      deriv[j] = j == dir ? transform(cells, stencil(j, true, true), axis)
+                          : transform(face, stencil(j, false, true), -1 - j);
     }
     Box fl = lo, fh = hi;
     ++fh[dim];
@@ -254,14 +272,21 @@ Tensor DiffusionImpl::forward_cubed_sphere(Tensor du, Tensor w, Tensor temp,
     // wall extrapolation falls back to the nearest cell if it is negative.
     auto cf = torch::empty({2, face.size(1), face.size(2), face.size(3)},
                            w.options());
+    // linear in position: x1 cell widths from the faces (#280), equal in x2/x3
+    auto h = dir ? torch::ones({n}, w.options())
+                 : c->dx1f.to(w.options()).slice(0, lo[2], hi[2]);
+    std::vector<int64_t> hs(4, 1);
+    hs[axis + 4] = n - 1;
+    auto hl = h.slice(0, 0, n - 1).view(hs), hr = h.slice(0, 1, n).view(hs);
     cf.narrow(axis, 1, n - 1)
-        .copy_(0.5 * (coefficients.narrow(axis, 0, n - 1) +
-                      coefficients.narrow(axis, 1, n - 1)));
+        .copy_(hr / (hl + hr) * coefficients.narrow(axis, 0, n - 1) +
+               hl / (hl + hr) * coefficients.narrow(axis, 1, n - 1));
     for (int side = 0; side < 2; ++side) {
       int near = side ? n - 1 : 0, next = side ? n - 2 : 1,
           index = side ? n : 0;
       auto v = coefficients.select(axis, near);
-      auto extrap = 1.5 * v - 0.5 * coefficients.select(axis, next);
+      auto g = h[near] / (h[near] + h[next]);
+      auto extrap = (1. + g) * v - g * coefficients.select(axis, next);
       cf.select(axis, index).copy_(torch::where(extrap >= 0., extrap, v));
     }
     auto div = vg[0][0] + vg[1][1] + vg[2][2];

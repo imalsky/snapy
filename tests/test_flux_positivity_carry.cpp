@@ -38,11 +38,15 @@ struct Arm {
 };
 
 //! one hydro forward (dt = 1) of a uniform column, limiter on or off;
-//! shape, if given, then edits the primitive state (and gets il)
+//! shape, if given, then edits the primitive state (and gets il). The species
+//! fall off along x1 (factors 1, 0.1, 0.01, 0.01, 0.1, 1) unless uniform:
+//! with the dry air drained as hard as the species, a uniform ratio is not
+//! limited (the relative rule), so each limited donor needs a poorer x1
+//! neighbour to keep the carry running
 Arm forward_once(bool limiter, std::function<void(YAML::Node&)> const& edit,
                  double vx, double vy, double vz = 0.,
                  std::function<void(torch::Tensor&, int)> const& shape = {},
-                 torch::Device device = torch::kCPU) {
+                 torch::Device device = torch::kCPU, bool uniform = false) {
   auto card = YAML::LoadFile(kCard);
   card["dynamics"]["equation-of-state"]["limiter"] = limiter;
   edit(card);
@@ -68,6 +72,12 @@ Arm forward_once(bool limiter, std::function<void(YAML::Node&)> const& edit,
   w[IVZ].fill_(vz);
   w[ICY].fill_(0.01);      // vapor
   w[ICY + 1].fill_(0.02);  // cloud
+  if (!uniform) {
+    double fall[6] = {1., 0.1, 0.01, 0.01, 0.1, 1.};
+    for (int c = 0; c < 6; ++c) {
+      w.narrow(0, ICY, 2).select(-1, coord->il() + c).mul_(fall[c]);
+    }
+  }
   if (shape) shape(w, coord->il());
   arm.vars["hydro_w"] = w;
   arm.block->initialize(arm.vars);
@@ -154,6 +164,7 @@ void expect_carried(Arm const& off, Arm const& on, int dim = 1,
     int* count = at(F0, ICY, i) > 0. ? up : down;
     if (lim && apart && count) ++*count;
   }
+  std::printf("limited species faces: %d\n", limited);
   EXPECT_GT(limited, 0) << "the limiter never withheld a species flux";
 
   // unit cell volumes: the correction only moves energy and momentum
@@ -169,8 +180,10 @@ void expect_carried(Arm const& off, Arm const& on, int dim = 1,
 }  // namespace
 
 // A uniform column moving up at 2 m/s with dt = dx / 1: every face drains its
-// lower cell of twice the vapour and cloud it holds, so theta = 1/2 there and
-// half of each species flux is withheld (both Riemann solvers).
+// lower cell of twice the vapour and cloud it holds, so theta = 1/2 there; with
+// the dry air drained as hard, the relative rule leaves theta' = 0.55 at the
+// cells beside a ten times poorer neighbour, which withhold 45% of each species
+// flux (both Riemann solvers).
 TEST(flux_positivity, withheld_advected_mass_keeps_its_energy_and_momentum) {
   for (std::string rs : {"lmars", "hllc"}) {
     SCOPED_TRACE(rs);
@@ -181,6 +194,18 @@ TEST(flux_positivity, withheld_advected_mass_keeps_its_energy_and_momentum) {
     auto on = forward_once(true, edit, 2., 3.);
     expect_carried(off, on);
   }
+}
+
+// The same column with a uniform species ratio: the dry air is drained as hard
+// as the species, so the relative rule withholds nothing and the fluxes of the
+// limited arm equal the unlimited ones.
+TEST(flux_positivity, uniform_ratio_is_not_withheld) {
+  auto keep = [](YAML::Node&) {};
+  auto off = forward_once(false, keep, 2., 3., 0., {}, torch::kCPU, true);
+  auto on = forward_once(true, keep, 2., 3., 0., {}, torch::kCPU, true);
+  EXPECT_TRUE(
+      torch::equal(off.block->phydro->flux1(), on.block->phydro->flux1()));
+  EXPECT_TRUE(torch::equal(off.du, on.du));
 }
 
 // A resting column (x2 wind 3 m/s) whose cloud settles at 2 m/s: each face
@@ -216,8 +241,9 @@ TEST(flux_positivity, withheld_mass_keeps_its_energy_and_momentum_along_x2) {
 // card's donor-cell faces lmars moves the species at (vL + vR) / 2. The
 // lower half moves up and the upper half down, so faces c0|c1 and c1|c2 are
 // limited upward (donors c0, c1) and faces c3|c4 and c4|c5 downward (donors
-// c4, c5), each by theta = 1/2.2 or 1/2; a swapped donor index would carry
-// the other neighbour's energy and momentum.
+// c4, c5), each by theta = 1/2.2 or 1/2 relaxed with phi = 0.1 (the species
+// fall-off); a swapped donor index would carry the other neighbour's energy
+// and momentum.
 void withheld_mass_keeps_its_donors_energy_and_momentum(torch::Device device) {
   auto shape = [](torch::Tensor& w, int il) {
     double rho[6] = {1.00, 1.15, 0.90, 1.05, 0.85, 1.20};

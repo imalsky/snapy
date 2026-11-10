@@ -2,6 +2,7 @@
 #include <ATen/TensorIterator.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include <algorithm>
 #include <limits>
 
 #include <snap/utils/loops.cuh>
@@ -108,15 +109,27 @@ void call_nu_cuda(at::TensorIterator& iter, at::Tensor coeff, int dim,
                                    sizeof(scalar_t), &shared);
 
     if (tile == 0) {
-      native::stencil_kernel<scalar_t, 2>(
-          iter, dim, /*buffers=*/0,
-          [=] __device__(char* const data[2], unsigned int strides[2],
-                         scalar_t* smem) {
-            auto out = reinterpret_cast<scalar_t*>(data[0] + strides[0]);
-            auto w = reinterpret_cast<scalar_t*>(data[1] + strides[1]);
-            interp_nu_untiled<NCoeff>(out, w, c, nvar, stride_in1, stride_in2,
-                                      stride_out1, stride_out2, scale, smem);
-          });
+      // One launch holds every variable's whole line in shared memory; more
+      // variables than fit go in parts of at most `per`. The rows are in
+      // global memory and indexed by face, so each part reads the same rows.
+      int per = native::stencil_vars_per_launch(nline64, 0, sizeof(scalar_t));
+      for (int v0 = 0; v0 < nvar; v0 += per) {
+        int nv = std::min(per, nvar - v0);
+        int64_t off_in = static_cast<int64_t>(v0) * stride_in2;
+        int64_t off_out = static_cast<int64_t>(v0) * stride_out2;
+        native::stencil_kernel<scalar_t, 2>(
+            iter, dim, /*buffers=*/0,
+            [=] __device__(char* const data[2], unsigned int strides[2],
+                           scalar_t* smem) {
+              auto out =
+                  reinterpret_cast<scalar_t*>(data[0] + strides[0]) + off_out;
+              auto w =
+                  reinterpret_cast<scalar_t*>(data[1] + strides[1]) + off_in;
+              interp_nu_untiled<NCoeff>(out, w, c, nv, stride_in1, stride_in2,
+                                        stride_out1, stride_out2, scale, smem);
+            },
+            nv);
+      }
       return;
     }
 

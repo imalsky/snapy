@@ -96,6 +96,13 @@ namespace snap {
 //! absolute index i > 0 rather than on i > il. `dsf` plays no part in the
 //! fixed point, so the balance is unaffected; nothing else here depends on it.
 //!
+//! `stretched` is the grid key's classification (#280): pass
+//! `coord->options->stretched_x1()` of the grid the column comes from. A
+//! stretched x1 is non-uniform in every block whatever its widths, and its
+//! cell pressure is the six-face degree-5 Lagrange cell average with per-cell
+//! rows (hydro_ref_x1_stretched_rows); a column of unequal widths takes them
+//! whatever the flag.
+//!
 //! Under SNAP_X1_CENTROID_EXACT a spherical-polar block's reference works on
 //! plain means converted from its r^2 means, which this column does not model:
 //! the caller then passes geometry "cartesian", and anything else (unknown, or

@@ -1,5 +1,7 @@
 // snap
+#include <snap/coord/coordinate.hpp>
 #include <snap/hydro/hydro.hpp>
+#include <snap/mesh/meshblock.hpp>
 
 #include "../eos/ideal_moist.hpp"
 #include "riemann_dispatch.hpp"
@@ -34,6 +36,14 @@ torch::Tensor RoeSolverImpl::forward(torch::Tensor wl, torch::Tensor wr,
   auto cl = peos->compute("WA->L", {wl, gammal});
   auto cr = peos->compute("WA->L", {wr, gammar});
 
+  // solve in the face-local orthonormal frame, as lmars.cpp does
+  auto pcoord = phydro->pmb->pcoord;
+  for (auto const& w : {wl, wr}) {
+    if (dim == 1) pcoord->prim2local3_(w);
+    if (dim == 2) pcoord->prim2local2_(w);
+    if (dim == 3) pcoord->prim2local1_(w);
+  }
+
   auto face_pressure_out =
       face_pressure.defined() ? face_pressure : torch::empty_like(wl[IDN]);
   auto elr = torch::stack({eil, eir});
@@ -55,6 +65,10 @@ torch::Tensor RoeSolverImpl::forward(torch::Tensor wl, torch::Tensor wr,
   at::native::call_roe(flx.device().type(), iter, dim, ideal_moist, nvapor,
                        peos->options->gammad(), inv_mu_ratio_m1, cv_ratio_m1,
                        u0);
+
+  if (dim == 1) pcoord->flux2global3_(flx);
+  if (dim == 2) pcoord->flux2global2_(flx);
+  if (dim == 3) pcoord->flux2global1_(flx);
   return flx;
 }
 

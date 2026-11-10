@@ -13,6 +13,7 @@
 // snap
 #include <snap/snap.h>
 
+#include <snap/bc/bc_func.hpp>
 #include <snap/layout/layout.hpp>
 #include <snap/mesh/mesh.hpp>
 
@@ -265,4 +266,130 @@ TEST(CubedSphere, subdivided_panel_exchange_matches_one_block_cuda) {
       ADD_FAILURE() << "nb2=" << nb << " " << e.what();
     }
   }
+}
+
+// Only registered built-in no-ops are panel-exchange placeholders. In
+// particular, a caller's callback with the same name must remain physical.
+TEST(CubedSphere, custom_noop_callback_identity) {
+  EXPECT_TRUE(is_custom_noop(get_bc_func().at("custom_inner")));
+  EXPECT_TRUE(is_custom_noop(get_bc_func().at("custom_outer")));
+  EXPECT_FALSE(is_custom_noop(get_bc_func().at("reflecting_inner")));
+  EXPECT_FALSE(is_custom_noop(bcfunc_t{}));
+  bcfunc_t user = [](torch::Tensor const &, int, BoundaryFuncOptions) {};
+  EXPECT_FALSE(is_custom_noop(user));
+}
+
+namespace {
+void check_radial_halo_refresh(bool user_custom, bool cubed = true) {
+  std::ifstream input(write_card(1));
+  std::string card((std::istreambuf_iterator<char>(input)),
+                   std::istreambuf_iterator<char>());
+  auto replace = [&](std::string const &from, std::string const &to) {
+    card.replace(card.find(from), from.size(), to);
+  };
+  replace("nx1: 1", "nx1: 8");
+  replace("nghost: 2", "nghost: 3");
+  if (!cubed) {
+    replace("layout: cubed-sphere", "layout: slab");
+    replace("type: gnomonic-equiangle", "type: cartesian");
+  }
+  std::string path = "test_radial_halo_refresh.yaml";
+  {
+    std::ofstream output(path);
+    output << card;
+  }
+  auto opts = MeshBlockOptionsImpl::from_yaml(path);
+  if (user_custom) {
+    // Deliberately retain the custom_inner/custom_outer metadata: callback
+    // identity must protect a genuinely caller-provided physical boundary.
+    for (int f = 2; f < 6; ++f)
+      opts->bfuncs()[f] = [](torch::Tensor const &, int, BoundaryFuncOptions) {
+      };
+  }
+  auto mopts = MeshOptionsImpl::create();
+  mopts->block(opts);
+  mopts->blocks_per_process(cubed ? 6 : 1);
+  auto mesh = Mesh(mopts);
+  MeshVariables vars(mesh->blocks.size());
+  std::vector<torch::Tensor> interiors;
+  constexpr int ng = 3;
+  for (size_t ib = 0; ib < mesh->blocks.size(); ++ib) {
+    auto b = mesh->blocks[ib];
+    auto c = b->pcoord;
+    auto u = torch::zeros(
+        {5, c->options->nc3(), c->options->nc2(), c->options->nc1()},
+        torch::kFloat64);
+    // Nonuniform levels/columns detect stale data, while radial momentum
+    // distinguishes reflecting from a plain scalar copy.
+    auto levels = torch::arange(u.size(3), torch::kFloat64).view({1, 1, -1});
+    auto rows = torch::arange(u.size(1), torch::kFloat64).view({-1, 1, 1});
+    for (int q = 0; q < 5; ++q)
+      u[q] = 10. * (q + 1) + levels + .01 * rows + .1 * ib;
+    u.narrow(3, 0, ng).fill_(-777.);
+    u.narrow(3, u.size(3) - ng, ng).fill_(-777.);
+    vars[ib]["hydro_u"] = u;
+    interiors.push_back(
+        u.slice(1, ng, -ng).slice(2, ng, -ng).slice(3, ng, -ng).clone());
+  }
+  // Invoke the same per-block exchange+wall-refresh path used after every
+  // Mesh::forward stage; Mesh::exchange_ghost_zones only exchanges raw fields.
+  std::vector<std::thread> threads;
+  std::vector<std::exception_ptr> errors(mesh->blocks.size());
+  for (size_t ib = 0; ib < mesh->blocks.size(); ++ib)
+    threads.emplace_back([&, ib] {
+      try {
+        mesh->blocks[ib]->exchange_ghost_zones(vars[ib]);
+      } catch (...) {
+        errors[ib] = std::current_exception();
+      }
+    });
+  for (auto &thread : threads) thread.join();
+  for (auto const &error : errors)
+    if (error) std::rethrow_exception(error);
+  for (size_t ib = 0; ib < mesh->blocks.size(); ++ib) {
+    auto u = vars[ib].at("hydro_u");
+    EXPECT_TRUE(
+        torch::equal(interiors[ib],
+                     u.slice(1, ng, -ng).slice(2, ng, -ng).slice(3, ng, -ng)));
+    for (int dim : {1, 2})
+      for (bool upper : {false, true}) {
+        auto slab = u.narrow(dim, upper ? u.size(dim) - ng : 0, ng);
+        // Exclude horizontal diagonal corners: the face exchange does too.
+        int orth = 3 - dim;
+        slab = slab.slice(orth, ng, -ng);
+        for (int d = 0; d < ng; ++d)
+          for (bool top : {false, true}) {
+            int dst = top ? u.size(3) - ng + d : d;
+            int src = top ? u.size(3) - ng - 1 - d : 2 * ng - 1 - d;
+            auto got = slab.select(3, dst);
+            if (user_custom || !cubed) {
+              // Tangential momenta rotate during panel exchange; scalar rows
+              // and radial momentum retain the sentinel if wall refresh is
+              // skipped.
+              for (int q : {IDN, IPR, IVX})
+                EXPECT_TRUE(
+                    torch::equal(got[q], torch::full_like(got[q], -777.)));
+            } else {
+              auto expected = slab.select(3, src).clone();
+              expected[IVX].neg_();
+              EXPECT_TRUE(torch::equal(got, expected))
+                  << "block=" << ib << " dim=" << dim << " depth=" << d;
+            }
+          }
+      }
+  }
+}
+}  // namespace
+
+TEST(CubedSphere, radial_walls_refresh_exchange_owned_horizontal_halos) {
+  check_radial_halo_refresh(false);
+}
+
+TEST(CubedSphere,
+     radial_refresh_preserves_genuine_custom_horizontal_callbacks) {
+  check_radial_halo_refresh(true);
+}
+
+TEST(CubedSphere, radial_refresh_does_not_reclassify_slab_custom_noops) {
+  check_radial_halo_refresh(false, false);
 }

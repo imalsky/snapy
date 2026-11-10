@@ -187,6 +187,10 @@ class CoordinateImpl {
 
   virtual ~CoordinateImpl() = default;
 
+  //! faces for the per-face x1 rows: r^3/3 on a radial x1, whose cells hold
+  //! r^2 dr averages (#280); undefined where the shipped rows are exact
+  torch::Tensor x1_row_faces(std::string const& interp) const;
+
   int il() const { return options->nx1() > 1 ? options->nghost() : 0; }
 
   int iu() const {
@@ -211,6 +215,9 @@ class CoordinateImpl {
   //! This block's slice of the global face array for one axis.
   static torch::Tensor block_faces_(double gmin, double gmax, int gnx, int nx,
                                     int ix, int nghost);
+
+  //! dx1f, x1v and dx1v of this block, uniform or stretched (#280)
+  std::array<torch::Tensor, 3> x1_metrics_() const;
 
   //! module methods
   virtual torch::Tensor center_width1() const;

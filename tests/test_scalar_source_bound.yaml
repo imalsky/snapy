@@ -26,4 +26,4 @@ scalar:
   nvar: 1
   names: [tr]
   upper-bound: 1.
-  reconstruct: {type: dc, scale: false, shock: false}
+  reconstruct: {type: dc, shock: false}

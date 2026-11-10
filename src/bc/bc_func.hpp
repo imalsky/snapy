@@ -38,3 +38,7 @@ struct BCRegistrar {
 // callbacks.
 bool is_outflow(bcfunc_t const& func);
 bool is_reflecting(bcfunc_t const& func);
+
+// The built-in custom callbacks intentionally do nothing. User callbacks,
+// regardless of their registered name, are not exchange placeholders.
+bool is_custom_noop(bcfunc_t const& func);

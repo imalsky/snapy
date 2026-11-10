@@ -254,6 +254,28 @@ template void vic_redistribute_cuda<3>(at::TensorIterator &, double, double,
 template void vic_redistribute_cuda<5>(at::TensorIterator &, double, double,
                                        int);
 
+// the donor sweep of MeshBlock's implicit tracer transfer, one thread per
+// column, so no host read decides whether it binds
+void donor_cap_cuda(at::Tensor &P, at::Tensor const &held, int is, int ie) {
+  at::cuda::CUDAGuard device_guard(P.device());
+  TORCH_CHECK(P.is_contiguous() && P.sizes() == held.sizes());
+  auto h = held.contiguous();
+  int64_t nc1 = P.size(-1), ncol = P.numel() / nc1;
+
+  AT_DISPATCH_FLOATING_TYPES(P.scalar_type(), "donor_cap_cuda", [&]() {
+    auto q = P.data_ptr<scalar_t>();
+    auto hd = h.data_ptr<scalar_t>();
+    at::native::launch_legacy_kernel<128, 1>(ncol, [=] __device__(int col) {
+      auto qc = q + col * nc1, hc = hd + col * nc1;
+      scalar_t avail = hc[is];
+      for (int i = is + 1; i <= ie; ++i) {
+        qc[i] = ::max(::min(qc[i], avail), -hc[i]);
+        avail = hc[i] + qc[i];
+      }
+    });
+  });
+}
+
 }  // namespace snap
 
 namespace at::native {
@@ -265,5 +287,6 @@ REGISTER_CUDA_DISPATCH(vic_solve_full, &snap::vic_solve_cuda<5>);
 REGISTER_CUDA_DISPATCH(vic_redistribute_partial,
                        &snap::vic_redistribute_cuda<3>);
 REGISTER_CUDA_DISPATCH(vic_redistribute_full, &snap::vic_redistribute_cuda<5>);
+REGISTER_CUDA_DISPATCH(donor_cap, &snap::donor_cap_cuda);
 
 }  // namespace at::native

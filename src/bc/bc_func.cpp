@@ -241,3 +241,10 @@ bool is_reflecting(bcfunc_t const& func) {
   auto ptr = func.target<Pointer>();
   return ptr && (*ptr == reflecting_inner || *ptr == reflecting_outer);
 }
+
+bool is_custom_noop(bcfunc_t const& func) {
+  using Pointer =
+      void (*)(torch::Tensor const&, int, snap::BoundaryFuncOptions);
+  auto ptr = func.target<Pointer>();
+  return ptr && (*ptr == custom_inner || *ptr == custom_outer);
+}

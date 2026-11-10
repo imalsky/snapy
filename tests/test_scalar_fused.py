@@ -136,7 +136,7 @@ def config(case):
     if case == "box_x1rat":
         cfg["geometry"]["cells"]["x1rat"] = 1.1
     if case.endswith("_plm"):
-        cfg["scalar"]["reconstruct"] = {"type": "plm", "scale": False, "shock": True}
+        cfg["scalar"]["reconstruct"] = {"type": "plm", "shock": True}
     return cfg
 
 

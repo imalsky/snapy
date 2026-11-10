@@ -110,9 +110,12 @@ int main() {
   // This mixed flux has an upward advective cloud part and a downward
   // settling part.  Its component sums lock the two donor corrections: the
   // pre-fix single-donor carry gives different momentum/energy values.
+  // The vapour (q = 0.01 everywhere) is a uniform ratio over over-drained dry
+  // air, so the limiter no longer withholds it; with the vapour withheld as
+  // before, the cloud's carry gives 99901.819827557352 and 493328.12156816921.
   bool mixed_carry_correct =
-      std::abs(seam_flux_momentum1 - 99901.819827557352) < 1.e-7 &&
-      std::abs(seam_flux_energy - 493328.12156816886) < 5.e-3;
+      std::abs(seam_flux_momentum1 - 99901.855127834307) < 1.e-7 &&
+      std::abs(seam_flux_energy - 499161.89154918579) < 5.e-3;
   double mass_after = global_sum(layout, condensate_mass(block, vars[0]));
   bool conserved = std::abs(mass_after - mass_before) <= 1.e-12 * mass_before;
   double limiter_hits = global_sum(

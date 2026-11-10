@@ -322,10 +322,13 @@ struct TopCoolOptionsImpl {
     os << "-- top cooling options --\n";
     os << "* flux = " << flux() << "\n"
        << "* depth = " << depth() << "\n";
+    if (thickness() > 0.) os << "* thickness = " << thickness() << "\n";
   }
 
   ADD_ARG(double, flux) = 0.0;
   ADD_ARG(int, depth) = 1;
+  //! the layer in x1 length units; used instead of depth when > 0 (#280)
+  ADD_ARG(double, thickness) = 0.0;
 };
 using TopCoolOptions = std::shared_ptr<TopCoolOptionsImpl>;
 
@@ -365,10 +368,13 @@ struct BotHeatOptionsImpl {
     os << "-- bottom heating options --\n";
     os << "* flux = " << flux() << "\n"
        << "* depth = " << depth() << "\n";
+    if (thickness() > 0.) os << "* thickness = " << thickness() << "\n";
   }
 
   ADD_ARG(double, flux) = 0.0;
   ADD_ARG(int, depth) = 1;
+  //! the layer in x1 length units; used instead of depth when > 0 (#280)
+  ADD_ARG(double, thickness) = 0.0;
 };
 using BotHeatOptions = std::shared_ptr<BotHeatOptionsImpl>;
 

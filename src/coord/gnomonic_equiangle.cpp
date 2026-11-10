@@ -29,16 +29,13 @@ void GnomonicEquiangleImpl::reset() {
       "Ghost zone size must be at least half of the interpolation order");
 
   // dimension 1
-  // Global cell width, not this block's own; see dx1() in coordinate.hpp.
-  auto dx = op->dx1();
-
-  dx1f = register_buffer("dx1f", torch::ones(op->nc1(), torch::kFloat64) * dx);
-  x1v = register_buffer("x1v", 0.5 * (x1f.slice(0, 0, op->nc1()) +
-                                      x1f.slice(0, 1, op->nc1() + 1)));
-  dx1v = register_buffer("dx1v", torch::ones(op->nc1(), torch::kFloat64) * dx);
+  auto [df, xv, dv] = x1_metrics_();
+  dx1f = register_buffer("dx1f", df);
+  x1v = register_buffer("x1v", xv);
+  dx1v = register_buffer("dx1v", dv);
 
   // dimension 2
-  dx = op->dx2();
+  auto dx = op->dx2();
   dx2f = register_buffer("dx2f", torch::ones(op->nc2(), torch::kFloat64) * dx);
   x2v = register_buffer("x2v", 0.5 * (x2f.slice(0, 0, op->nc2()) +
                                       x2f.slice(0, 1, op->nc2() + 1)));

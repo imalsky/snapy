@@ -11,6 +11,7 @@
 #include "flux_positivity.hpp"
 #include "gravity_work_radial.hpp"
 #include "hydro.hpp"
+#include "x1_mass_covariance.hpp"
 
 namespace snap {
 
@@ -29,25 +30,6 @@ static torch::Tensor d1_pressure(torch::Tensor const& p,
       (p.select(-1, is + 1) - p.select(-1, is)) / (x1v[is + 1] - x1v[is]);
   d.select(-1, ie - 1) =
       (p.select(-1, ie) - p.select(-1, ie - 1)) / (x1v[ie] - x1v[ie - 1]);
-  return d;
-}
-
-// SNAP_X1_MASS_COVARIANCE (HydroImpl::x1_mass_covariance): the x1
-// reconstruction treats the cell velocity m1/rho as the cell average of w; in a
-// stratified column that adds dz^2/12 rho_z w_z to the face mass flux. Subtract
-// it from the reconstructed velocity (the x1 analogue of SNAP_FLUX_COVARIANCE).
-
-// centred x1 derivative over x1v for every cell that has both neighbours; the
-// first and last array cells copy their neighbour's value
-static torch::Tensor d1_centred(torch::Tensor const& a,
-                                torch::Tensor const& x1v) {
-  int n1 = a.size(-1);
-  auto dx = x1v.narrow(0, 2, n1 - 2) - x1v.narrow(0, 0, n1 - 2);
-  auto d = torch::empty_like(a);
-  d.narrow(-1, 1, n1 - 2)
-      .copy_((a.narrow(-1, 2, n1 - 2) - a.narrow(-1, 0, n1 - 2)) / dx);
-  d.select(-1, 0).copy_(d.select(-1, 1));
-  d.select(-1, n1 - 1).copy_(d.select(-1, n1 - 2));
   return d;
 }
 
@@ -102,7 +84,7 @@ torch::Tensor HydroImpl::_flux_covariance(torch::Tensor const& wl,
   // the face-normal velocity in the face-local orthonormal frame -- the
   // component the energy flux actually carries. Projected on our own copy:
   // whether the Riemann solver projects its inputs in place is the solver's
-  // business (roe does not), so do not read that side effect.
+  // business (plume_roe does not), so do not read that side effect.
   if (dim == 2) {
     pcoord->prim2local2_(wbar);
   } else {
@@ -480,21 +462,17 @@ torch::Tensor HydroImpl::forward(double dt, torch::Tensor u,
         velocity = wx1[IVX].clone();
         auto x1v = pmb->pcoord->x1v.to(w.device(), w.scalar_type());
         auto dx1f = pmb->pcoord->dx1f.to(w.device(), w.scalar_type());
-        auto rho_1 = d1_centred(density, x1v);
+        bool stretched = pmb->pcoord->options->stretched_x1();
+        auto rho_1 = x1_cov_d1_centred(density, x1v, stretched);
         // next to a reflecting wall the even ghost density is not the
         // stratified column: one-sided second order in the first/last cell
-        auto one_sided = [&](int i, int s) {
-          auto h = x1v[i + s] - x1v[i];
-          return s *
-                 (-3. * density.select(-1, i) + 4. * density.select(-1, i + s) -
-                  density.select(-1, i + 2 * s)) /
-                 (2. * s * h);
-        };
         if (phys_x1inner && !is_outflow(pmb->options->bfuncs()[0]))
-          rho_1.select(-1, is).copy_(one_sided(is, 1));
+          rho_1.select(-1, is).copy_(
+              x1_cov_one_sided(density, x1v, is, 1, stretched));
         if (phys_x1outer && !is_outflow(pmb->options->bfuncs()[1]))
-          rho_1.select(-1, iu).copy_(one_sided(iu, -1));
-        auto w_1 = d1_centred(velocity, x1v);
+          rho_1.select(-1, iu).copy_(
+              x1_cov_one_sided(density, x1v, iu, -1, stretched));
+        auto w_1 = x1_cov_d1_centred(velocity, x1v, stretched);
         wx1[IVX] -= dx1f * dx1f / 12. * rho_1 * w_1 / density;
         // ghosts at reflecting walls: odd mirror of the corrected interior
         if (phys_x1inner && !is_outflow(pmb->options->bfuncs()[0]))
@@ -578,9 +556,11 @@ torch::Tensor HydroImpl::forward(double dt, torch::Tensor u,
       }
     }
 
-    // sedimentation flux; skipped when x1 flux is off (_flux1 not rewritten)
+    // sedimentation flux; skipped when x1 flux is off (_flux1 not rewritten).
+    // Its settling part is kept wherever step 4.C can limit species: with the
+    // eos limiter, or with the covariance rows that switch it on (cov2, cov3)
     if (psed && !options->disable_flux_x1()) {
-      bool carry = options->eos()->limiter() && ny > 0;
+      bool carry = (options->eos()->limiter() || flux_covariance()) && ny > 0;
       auto fadv = carry ? _flux1.narrow(0, ICY, ny).clone() : torch::Tensor();
       psed->forward(w, _flux1);
       if (carry) fsed1 = _flux1.narrow(0, ICY, ny) - fadv;
@@ -870,6 +850,29 @@ torch::Tensor HydroImpl::forward(double dt, torch::Tensor u,
 
     torch::Tensor drain;
     auto theta = flux_positivity_theta(uy, f1, f2, f3, pmb->pcoord, dt, &drain);
+    // the eos limiter does not limit the mass flux either: where it drains
+    // the dry air too (Courant>1), the neighbours (implicit x1 refill, inflow
+    // along x2, x3) bring their q back, so a species may drain past its
+    // content only as far as the poorer neighbour repays: all of it at a
+    // uniform q, none beside an empty cell
+    {
+      auto m = [&](torch::Tensor const& f) {
+        return f.defined() ? f.narrow(0, IDN, 1) : torch::Tensor();
+      };
+      auto rho = u.narrow(0, IDN, 1);
+      auto td = flux_positivity_theta(rho, m(_flux1), m(_flux2), m(_flux3),
+                                      pmb->pcoord, dt);
+      auto phi = flux_positivity_share(uy / rho);
+      // settling mass is not dry air: nothing refills it, so a cell it drains
+      // keeps the plain theta
+      if (fsed1.defined()) {
+        auto out = fsed1.clamp_min(0.).roll(-1, DIM1) + (-fsed1).clamp_min(0.);
+        phi.masked_fill_(out > 0., 0.);
+      }
+      theta = torch::where((td < 1.) & (td > 0.),
+                           theta + phi * ((theta / td).clamp_max(1.) - theta),
+                           theta);
+    }
     // census of interior (cell, species) entries, before the ghost fill
     auto cells = pmb->part({0, 0, 0}, PartOptions().exterior(false));
     auto ti = theta.index(cells).to(torch::kFloat64);
@@ -1083,11 +1086,13 @@ torch::Tensor HydroImpl::forward(double dt, torch::Tensor u,
     auto type1 = precon1->pinterp1->options->type();
     if (!gw_cell && !radial_exact &&
         (type1 == "cp3" || type1 == "cp5" || type1 == "weno5")) {
+      // no two-point H is exact on unequal cells; option F is (#280)
       TORCH_CHECK(!pmb->pcoord->options->stretched_x1(),
-                  "the dx^2/12 x1 curvature correction of cp3/cp5/weno5 is "
-                  "not supported on a stretched x1 (#280); use gravity-work: "
-                  "face with SNAP_GRAVITY_WORK_RADIAL_EXACT on (the default) "
-                  "or gravity-work: cell");
+                  "the dx^2/12 x1 curvature flux H of cp3/cp5/weno5 is a "
+                  "uniform-grid device: a stretched x1 uses option F, "
+                  "gravity-work: face with SNAP_GRAVITY_WORK_RADIAL_EXACT on "
+                  "(the default), fourth order there; or use gravity-work: "
+                  "cell (#280)");
       int n = ie - is;
       auto x1v = pmb->pcoord->x1v;
       auto rhov = w[IDN] * w[IVX];
@@ -1184,10 +1189,10 @@ torch::Tensor HydroImpl::forward(double dt, torch::Tensor u,
     //
     // Scale ONLY the dt handed to the correction. du, the flux divergence and
     // the forcings stay at the full dt, or this becomes a different operator.
-    // Applied only for the 3-stage integrator, matching the behaviour
+    // Applied for integrators of 3+ stages (rk3, rk3s4), matching the behaviour
     // already in production; generalising would change rk1/rk2 results.
     double dt_corr = dt;
-    if (pmb->pintg->stages.size() == 3) {
+    if (pmb->pintg->stages.size() >= 3) {
       if (rk_stage >= 0 && rk_stage < pmb->pintg->stages.size()) {
         dt_corr *= pmb->pintg->stages[rk_stage].wght2();
       } else {

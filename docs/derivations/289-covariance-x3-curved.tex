@@ -1117,7 +1117,7 @@ override, derived by §2.7 from whichever power of $r$ its own \texttt{face\_are
 \textbf{Why \texttt{wbar} is projected on a private copy.} \texttt{LmarsSolverImpl::forward} calls
 \texttt{prim2local2\_(wl)}/\texttt{(wr)} in place (\texttt{src/riemann/lmars.cpp:60-61}), so reading
 the solver's inputs *after* the call would also give the local-frame normal
-velocity — but \texttt{roe} and \texttt{plume\_roe} do not project at all, so that side effect
+velocity — but \texttt{plume\_roe} does not project at all, so that side effect
 is not a contract. \texttt{\_flux\_covariance} therefore runs \textbf{before} the Riemann call
 on \texttt{0.5*(wl+wr)} and projects that copy itself; the result is added to the flux
 after the call. \texttt{\_set\_face2\_metric()} is idempotent, so the extra call does not

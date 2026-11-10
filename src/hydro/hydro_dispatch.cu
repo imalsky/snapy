@@ -51,7 +51,7 @@ void hydro_ref_x1_cuda(torch::Tensor const &w, torch::Tensor const &dx1f,
   at::cuda::CUDAGuard device_guard(w.device());
   int ncolumns = w.size(1) * w.size(2);
   int nc1 = w.size(3);
-  int threads = 256;
+  int threads = std::min(256, (nc1 + 31) / 32 * 32);
   int blocks = ncolumns;
   auto stream = at::cuda::getCurrentCUDAStream();
 

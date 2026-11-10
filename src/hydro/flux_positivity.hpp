@@ -85,6 +85,15 @@ torch::Tensor flux_positivity_theta(torch::Tensor const& u,
                                     Coordinate const& pcoord, double dt,
                                     torch::Tensor* drain = nullptr);
 
+//! \brief The share phi of a ratio q's relaxed drain that its neighbours repay.
+//!
+//! phi = clamp(min(q of the two neighbours along every resolved dimension) / q,
+//! 0, 1), and 0 where q <= 0. A cell drained past its content gets its ratio
+//! back from its neighbours (the implicit x1 refill, the inflow along x2 and
+//! x3), so it may drain past its content only as far as the poorer one repays.
+//! \param q  ratio to the dry density, (nchan, nc3, nc2, nc1)
+torch::Tensor flux_positivity_share(torch::Tensor const& q);
+
 //! \brief Scale each face's flux by the donor cell's theta, in place.
 //!
 //! The donor of a face is the cell the flux drains: the lower cell where the

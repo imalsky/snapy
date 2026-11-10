@@ -97,7 +97,7 @@ Mesh make_mesh(torch::Device device, std::string const& wall, int nb2 = 1,
 scalar:
   nvar: 1
   names: [tracer]
-  reconstruct: {type: weno5, scale: false, shock: false}
+  reconstruct: {type: weno5, shock: false}
 )";
   }
   for (std::string face : {"x1-inner: ", "x1-outer: "}) {

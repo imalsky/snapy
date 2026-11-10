@@ -39,7 +39,7 @@ dynamics:
 scalar:
   nvar: 2
   names: [tr0, tr1]
-  reconstruct: {type: weno5, scale: false, shock: false}
+  reconstruct: {type: weno5, shock: false}
 
 geometry:
   type: cartesian

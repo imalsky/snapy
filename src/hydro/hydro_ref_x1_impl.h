@@ -69,7 +69,9 @@ inline DISPATCH_MACRO void hydro_ref_x1_scan_impl(T const* w, T const* dx1f,
 //! r1 is nearly empty. A non-positive value keeps the wall cell.
 template <typename T>
 inline DISPATCH_MACRO T hydro_ref_x1_wall_rop(T r0, T r1, T k) {
-  T e = r1 > r0 ? r0 * pow(r0 / r1, k) : r0 + k * (r0 - r1);
+  T q = r0 / r1, qk = k == floor(k) ? q : pow(q, k);
+  for (int n = 1; k == floor(k) && n < k; ++n) qk *= q;
+  T e = r1 > r0 ? r0 * qk : r0 + k * (r0 - r1);
   return e > T(0) ? e : r0;
 }
 

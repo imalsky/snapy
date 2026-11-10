@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <yaml-cpp/yaml.h>
 
 #include <future>
 #include <snap/coord/coord_utils.hpp>
@@ -14,9 +15,15 @@
 
 using namespace snap;
 namespace {
-Mesh make_mesh(int n = 12, int partitions = 1) {
+Mesh make_mesh(int n = 12, int partitions = 1, std::vector<double> x1f = {}) {
   auto opts = MeshOptionsImpl::from_yaml("test_diffusion_cubed_sphere.yaml");
   auto c = opts->block()->coord();
+  if (!x1f.empty()) {  // #280: a stretched x1
+    int m = x1f.size() - 1;
+    c->nx1(m).global_nx1(m).nghost(3).x1min(x1f.front()).x1max(x1f.back());
+    c->global_x1min(x1f.front()).global_x1max(x1f.back()).x1f_interior(x1f);
+    opts->block()->hydro()->recon1()->interp()->type("weno5");
+  }
   c->nx2() = n;
   c->nx3() = n;
   c->global_nx2() = n * partitions;
@@ -124,6 +131,29 @@ double harmonic_error(int n) {
   EXPECT_LT(diss, 0.);
   return std::sqrt(error / norm);
 }
+// the stage-2 stretched x1 faces (#280), or the same faces mapped onto [10, 11]
+MeshOptions stretched_cs_options(int nx2 = 24, bool unit = false) {
+  auto f = YAML::LoadFile("test_stage2_cubed_stretched.yaml")["geometry"]["x1f"]
+               .as<std::vector<double>>();
+  double f0 = f.front(), f1 = f.back();
+  if (unit)
+    for (auto &x : f) x = 10. + (x - f0) / (f1 - f0);
+  auto op = MeshOptionsImpl::from_yaml("test_diffusion_cubed_sphere.yaml");
+  op->block()->coord()->nx1(30).global_nx1(30).nx2(nx2).global_nx2(nx2);
+  op->block()->coord()->nx3(nx2).global_nx3(nx2).nghost(3).x1min(f.front());
+  op->block()->coord()->x1max(f.back()).global_x1min(f.front());
+  op->block()->coord()->global_x1max(f.back()).x1f_interior(f);
+  op->block()->hydro()->recon1()->interp()->type("weno5");
+  op->blocks_per_process(6);
+  return op;
+}
+Mesh to_device(Mesh mesh, bool gpu) {
+  if (gpu) {
+    for (auto b : mesh->blocks) b->get_layout()->options->device("cuda");
+    mesh->to(torch::Device(torch::kCUDA));
+  }
+  return mesh;
+}
 }  // namespace
 TEST(CubedSphereDiffusion, constant_state_and_rigid_rotation) {
   torch::set_num_threads(1);
@@ -148,17 +178,39 @@ TEST(CubedSphereDiffusion, harmonic_convergence_and_heat_conservation) {
 }
 TEST(CubedSphereDiffusion, radial_conductive_equilibrium) {
   torch::set_num_threads(1);
-  auto mesh = make_mesh();
-  for (auto b : mesh->blocks) {
-    b->phydro->pdiffusion->options->temperature_inner() = 300. + 2. / 10.;
-    b->phydro->pdiffusion->options->temperature_outer() = 300. + 2. / 11.;
+  // uniform x1, then the stage-2 faces mapped onto [10, 11] on CPU and CUDA;
+  // explicit, then (u1 - u0) / dt of one implicit radial step (dt = 1e3, so
+  // the rounding of u ~ 2e5 stays well under the tolerance)
+  for (int arm : {0, 1, 2}) {
+    if (arm == 2 && !snapy_cuda_test_enabled()) continue;
+    auto mesh = arm ? Mesh(stretched_cs_options(12, true)) : make_mesh();
+    for (auto b : mesh->blocks) {
+      b->phydro->pdiffusion->options->temperature_inner() = 300. + 2. / 10.;
+      b->phydro->pdiffusion->options->temperature_outer() = 300. + 2. / 11.;
+    }
+    auto s = states(mesh, 2);
+    for (auto &x : s)
+      if (arm == 2) x.w = x.w.cuda(), x.t = x.t.cuda();
+    auto du = apply_diffusion(to_device(mesh, arm == 2), s);
+    for (size_t i = 0; i < s.size(); ++i) {
+      EXPECT_LT(du[i][IPR]
+                    .index(interior(mesh->blocks[i]))
+                    .abs()
+                    .max()
+                    .item<double>(),
+                2.e-11);
+      auto b = mesh->blocks[i];
+      auto eos = b->phydro->peos;
+      auto w = s[i].w.clone();
+      w[IPR] = eos->species_cv_ref() * (eos->options->gammad() - 1.) * s[i].t;
+      auto u = eos->compute("W->U", {w}), u0 = u.clone();
+      b->phydro->pdiffusion->options->implicit_radial(true);
+      b->phydro->pdiffusion->radial_conduction_step(u, 1.e3);
+      EXPECT_LT(
+          (u - u0)[IPR].index(interior(b)).abs().max().item<double>() / 1.e3,
+          2.e-11);
+    }
   }
-  auto s = states(mesh, 2);
-  auto du = apply_diffusion(mesh, s);
-  for (size_t i = 0; i < s.size(); ++i)
-    EXPECT_LT(
-        du[i][IPR].index(interior(mesh->blocks[i])).abs().max().item<double>(),
-        2.e-11);
 }
 TEST(CubedSphereDiffusion, viscous_energy_conservation_and_dissipation) {
   torch::set_num_threads(1);
@@ -179,6 +231,61 @@ TEST(CubedSphereDiffusion, viscous_energy_conservation_and_dissipation) {
   }
   EXPECT_NEAR(energy, 0., 1.e-10);
   EXPECT_LT(work, 0.);
+}
+
+// #280: v = z g(r), g = sin(2 pi (r - 10)), on the stage-2 faces mapped onto
+// [10, 11] and split at their midpoints `l` times: relative L2 error of the
+// viscous tendency nu (lap v + grad div v / 3)
+double stretched_viscous_error(int l) {
+  auto f = YAML::LoadFile("test_stage2_cubed_stretched.yaml")["geometry"]["x1f"]
+               .as<std::vector<double>>();
+  double f0 = f.front(), f1 = f.back(), k = 2. * M_PI, error = 0., norm = 0.;
+  for (auto &x : f) x = 10. + (x - f0) / (f1 - f0);
+  for (int j = 0; j < l; ++j)
+    for (int i = f.size() - 2; i >= 0; --i)
+      f.insert(f.begin() + i + 1, (f[i] + f[i + 1]) / 2);
+  auto mesh = make_mesh(12 << l, 1, f);
+  auto s = states(mesh, 0);
+  auto du = std::vector<torch::Tensor>();
+  for (size_t i = 0; i < s.size(); ++i) {
+    auto c = mesh->blocks[i]->pcoord;
+    int panel = std::get<2>(mesh->blocks[i]->get_layout()->loc_of(
+        mesh->blocks[i]->options->layout()->rank()));
+    auto a = c->x2v.view({1, -1, 1}), b = c->x3v.view({-1, 1, 1});
+    auto r = c->x1v.view({1, 1, -1}), z = s[i].x[2];
+    auto g = (k * (r - 10.)).sin(), g1 = k * (k * (r - 10.)).cos();
+    auto g2 = -k * k * g, h = g1 / r, h1 = g2 / r - g1 / (r * r);
+    auto v = s[i].w.narrow(0, IVX, 3);
+    v[2].copy_(g.expand_as(v[2]));
+    cs_cart_to_contra_(v, a, b, panel);
+    auto t = (z * h1 / (3. * r)) * s[i].x;
+    t[2] += g2 + 2. * g1 / r + h / 3.;
+    t.mul_(0.01);  // nu_iso
+    cs_cart_to_contra_(t, a, b, panel);
+    coord_vec_lower_(t, c->cosine_cell_kj);
+    du.push_back(t);
+  }
+  auto got = apply_diffusion(mesh, s);
+  for (size_t i = 0; i < s.size(); ++i) {
+    auto c = mesh->blocks[i]->pcoord;
+    auto sl = interior(mesh->blocks[i]);
+    auto l2 = [&](torch::Tensor q) {  // three cells off each x1 wall
+      auto e = c->cell_volume().index(sl) * q.square().sum(0).index(sl);
+      return e.narrow(-1, 3, c->iu() - c->il() - 5).sum().item<double>();
+    };
+    error += l2(got[i].narrow(0, IVX, 3) - du[i]);
+    norm += l2(du[i]);
+  }
+  return std::sqrt(error / norm);
+}
+TEST(CubedSphereDiffusion, stretched_x1_viscosity) {
+  torch::set_num_threads(1);
+  double e[3] = {stretched_viscous_error(0), stretched_viscous_error(1),
+                 stretched_viscous_error(2)};
+  std::cout << "stretched viscous L2: " << e[0] << ", " << e[1] << ", " << e[2]
+            << std::endl;
+  EXPECT_GT(e[0] / e[1], 3.);
+  EXPECT_GT(e[1] / e[2], 3.8);
 }
 
 TEST(CubedSphereDiffusion, split_panels_preserve_constants_and_rotation) {
@@ -334,6 +441,45 @@ TEST(CubedSphereDiffusion, radial_implicit_conservation_stability_and_order) {
             << error[2] << std::endl;
   EXPECT_GT(error[0] / error[1], 3.5);
   EXPECT_GT(error[1] / error[2], 3.5);
+}
+
+// #280 (R19): with k linear in r on the stage-2 faces, the steady wall fluxes
+// of the implicit radial solve carry k(r_wall): the wall conductivity is
+// extrapolated linearly in position over the cell widths
+TEST(CubedSphereDiffusion, stretched_radial_implicit_wall_k) {
+  torch::set_num_threads(1);
+  auto f = YAML::LoadFile("test_stage2_cubed_stretched.yaml")["geometry"]["x1f"]
+               .as<std::vector<double>>();
+  double r0 = f.front(), r1 = f.back();
+  auto lin = [&](double x) { return 1. + 2. * (x - r0) / (r1 - r0); };
+  auto rc = [&](int i) { return 0.5 * (f[i] + f[i + 1]); };
+  auto scale = torch::empty({36}, torch::kFloat64);
+  for (int i = 0; i < 36; ++i) scale[i] = lin(rc(std::clamp(i - 3, 0, 29)));
+  for (bool gpu : {false, true}) {
+    if (gpu && !snapy_cuda_test_enabled()) continue;
+    auto op = stretched_cs_options(4);
+    auto d = op->block()->hydro()->diffusion();
+    d->nu_iso(0.).kappa_iso(1.e11).dynamic(false).implicit_radial(true);
+    d->kappa_scale_x1(scale).temperature_inner(300.).temperature_outer(310.);
+    auto mesh = Mesh(op);
+    auto b = mesh->blocks[0];
+    auto eos = b->phydro->peos;
+    auto u = eos->compute("W->U", {states(mesh, 0)[0].w});
+    u = u.to(to_device(mesh, gpu)->blocks[0]->pcoord->x1v.device());
+    for (int n = 0; n < 40; ++n)
+      b->phydro->pdiffusion->radial_conduction_step(u, 1.e9);
+    auto t = eos->compute("W->T", {eos->compute("U->W", {u})})
+                 .index(interior(b))
+                 .cpu()[0][0];
+    // k at the wall next to cell i, from the steady flux to neighbour j
+    for (auto [i, j, tw] : {std::tuple{0, 1, 300.}, std::tuple{29, 28, 310.}}) {
+      double rw = i ? r1 : r0, ti = t[i].item<double>();
+      double flux = 0.5 * (lin(rc(i)) + lin(rc(j))) * rc(i) * rc(j) /
+                    std::abs(rc(j) - rc(i)) * (ti - t[j].item<double>());
+      EXPECT_NEAR(flux * std::abs(rc(i) - rw) / (rw * rc(i) * (tw - ti)),
+                  lin(rw), 1.e-9 * lin(rw));
+    }
+  }
 }
 
 // Rayleigh-Ritz onset using the actual C++ heat/stress operator. This isolates

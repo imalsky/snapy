@@ -116,7 +116,7 @@ Mesh make_column(int nb1, int nx1, double nh, char const* gw, int ng = 3,
   auto block_opts = MeshBlockOptionsImpl::from_yaml(fname);
   std::remove(fname);
   block_opts->hydro()->grav()->grav1(g1);
-  if (g1 == 0.) {  // donor cell: the one scheme that runs on nghost 1
+  if (g1 == 0. || ng < 3) {  // donor cell: weno5 needs nghost >= 3 (S184)
     block_opts->hydro()->recon1()->interp()->type("dc");
     block_opts->hydro()->recon23()->interp()->type("dc");
   }

@@ -41,20 +41,6 @@ int recon_tile_width(int64_t nline, int nvar, int stencil, int64_t ncoeff,
   return tile;
 }
 
-// Variables one stencil_kernel launch can hold: every variable's whole line
-// plus the ncoeff weights must fit the default 48 KB of shared memory.
-int recon_vars_per_launch(int64_t nline, int64_t ncoeff, size_t scalar_size) {
-  if (nline <= 0) {  // empty input: stencil_kernel returns before launching
-    return std::numeric_limits<int>::max();
-  }
-  constexpr int64_t kSharedLimit = 48 * 1024;
-  int64_t n =
-      (kSharedLimit / static_cast<int64_t>(scalar_size) - ncoeff) / nline;
-  TORCH_CHECK(n >= 1, "recon line does not fit in shared memory: nline=", nline,
-              " ncoeff=", ncoeff);
-  return static_cast<int>(n);
-}
-
 // Same grid as stencil_kernel (one block per line), but block.x is the
 // tile width instead of the line length. grid.x stays 1: blockIdx is the
 // line id, so a second block along the line would read the wrong offset.
@@ -126,7 +112,8 @@ void call_poly_cuda(at::TensorIterator& iter, at::Tensor coeff, int dim) {
                                 sizeof(scalar_t), &shared);
 
     if (tile == 0) {
-      int per = recon_vars_per_launch(nline64, coeff.numel(), sizeof(scalar_t));
+      int per = native::stencil_vars_per_launch(nline64, coeff.numel(),
+                                                sizeof(scalar_t));
       if (nvar <= per) {
         native::stencil_kernel<scalar_t, 2>(
             iter, dim, coeff.numel(),
@@ -196,7 +183,8 @@ void call_weno3_cuda(at::TensorIterator& iter, at::Tensor coeff, int dim, bool s
                                 sizeof(scalar_t), &shared);
 
     if (tile == 0) {
-      int per = recon_vars_per_launch(nline64, coeff.numel(), sizeof(scalar_t));
+      int per = native::stencil_vars_per_launch(nline64, coeff.numel(),
+                                                sizeof(scalar_t));
       if (nvar <= per) {
         native::stencil_kernel<scalar_t, 2>(
             iter, dim, coeff.numel(),
@@ -266,7 +254,8 @@ void call_weno5_cuda(at::TensorIterator& iter, at::Tensor coeff, int dim, bool s
     // 1024 threads is the CUDA block limit. This launch is the one that
     // already ships, so a line that fits stays on it.
     if (tile == 0) {
-      int per = recon_vars_per_launch(nline64, coeff.numel(), sizeof(scalar_t));
+      int per = native::stencil_vars_per_launch(nline64, coeff.numel(),
+                                                sizeof(scalar_t));
       if (nvar <= per) {
         native::stencil_kernel<scalar_t, 2>(
             iter, dim, coeff.numel(),

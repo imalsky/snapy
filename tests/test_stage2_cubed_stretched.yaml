@@ -1,0 +1,25 @@
+reference-state: {Tref: 300., Pref: 1.e5}
+species: [{name: dry, composition: {H: 1.5, He: 0.15}, cv_R: 2.5}]
+geometry:
+  type: gnomonic-equiangle
+  x1f: [69911000, 69930977.479700, 69949866.161973, 69967725.387618, 69984611.263319,
+        70000576.837792, 70015672.268661, 70029944.979784, 70043439.810495, 70056199.156122,
+        70068263.101550, 70079669.547048, 70090454.327011, 70100658.510093, 70110415.975697,
+        70119720.955822, 70128543.604437, 70136883.597024, 70144758.463395, 70152191.362733,
+        70159207.735084, 70165829.227491, 70172077.358426, 70177972.882107, 70183535.429079,
+        70188790.795936, 70193761.536893, 70198454.425545, 70202882.006108, 70207058.311479,
+        70211000]
+  bounds: {x1min: 69911000., x1max: 70211000., x2min_pi: -0.25, x2max_pi: 0.25, x3min_pi: -0.25, x3max_pi: 0.25}
+  cells: {nx1: 30, nx2: 24, nx3: 24, nghost: 3}
+distribute: {layout: cubed-sphere, nb2: 1, nb3: 1, blocks_per_process: 6, verbose: false}
+dynamics:
+  equation-of-state: {type: ideal-gas, density-floor: 1.e-20, pressure-floor: 1.e-20, limiter: false}
+  reconstruct:
+    vertical: {type: weno5, scale: true, shock: false}
+    horizontal: {type: weno5, scale: true, shock: false}
+  riemann-solver: {type: lmars}
+boundary-condition:
+  external: {x1-inner: reflecting, x1-outer: reflecting, x2-inner: custom, x2-outer: custom, x3-inner: custom, x3-outer: custom}
+integration: {type: rk3, cfl: 0.45, implicit-scheme: 0, nlim: 100, tlim: 1.e12, ncycle_out: 0}
+forcing: {const-gravity: {grav1: -22.}}
+scalar: {nvar: 1, names: [uniform_q], reconstruct: {type: weno5, shock: false}, riemann-solver: {type: upwind}}

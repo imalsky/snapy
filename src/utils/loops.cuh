@@ -6,6 +6,7 @@
 #include <c10/cuda/CUDAException.h>
 
 #include <array>
+#include <limits>
 
 #include <cuda_runtime.h>
 
@@ -65,6 +66,21 @@ void gpu_kernel(at::TensorIterator& iter, const func_t& f) {
     auto offsets = offset_calc.get(idx);
     f(data.data(), offsets.data());
   });
+}
+
+// Variables one stencil_kernel launch can hold: every variable's whole line
+// plus `buffers` scalars must fit the default 48 KB of shared memory.
+inline int stencil_vars_per_launch(int64_t nline, int64_t buffers,
+                                   size_t scalar_size) {
+  if (nline <= 0) {  // empty input: stencil_kernel returns before launching
+    return std::numeric_limits<int>::max();
+  }
+  constexpr int64_t kSharedLimit = 48 * 1024;
+  int64_t n =
+      (kSharedLimit / static_cast<int64_t>(scalar_size) - buffers) / nline;
+  TORCH_CHECK(n >= 1, "stencil line does not fit in shared memory: nline=",
+              nline, " buffers=", buffers);
+  return static_cast<int>(n);
 }
 
 // nvar_shared: variables held in shared memory per line; -1 means all of

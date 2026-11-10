@@ -41,7 +41,7 @@ W_TOL = 1.0e-7  # m/s
 EPE_TOL = 1.0e-11
 
 
-def config(scheme):
+def config(scheme, integ="rk3"):
     rgas = 8.31446261815324
     return {
         "geometry": {"type": "cartesian",
@@ -58,7 +58,7 @@ def config(scheme):
         "boundary-condition": {"external": {"x1-inner": "reflecting", "x1-outer": "reflecting",
                                             "x2-inner": "periodic", "x2-outer": "periodic",
                                             "x3-inner": "periodic", "x3-outer": "periodic"}},
-        "integration": {"type": "rk3", "cfl": 0.5, "implicit-scheme": scheme, "nlim": -1, "tlim": 1.e9},
+        "integration": {"type": integ, "cfl": 0.5, "implicit-scheme": scheme, "nlim": -1, "tlim": 1.e9},
         "forcing": {"const-gravity": {"grav1": -GRAV, "gravity-work": "face"}},
     }
 
@@ -82,13 +82,13 @@ def corrected_pe(rho, x1f, x1v, grav1, spherical=False, centroid=False):
     return pe
 
 
-def run(scheme, dt, w0, nstep, device):
+def run(scheme, dt, w0, nstep, device, integ="rk3"):
     """Returns (finite, steps run, max |w|, relative E+PE drift)."""
     import snapy
     from snapy import MeshBlock, MeshBlockOptions, kIDN, kIPR, kIV1
 
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, dir=os.getcwd()) as f:
-        yaml.safe_dump(config(scheme), f)
+        yaml.safe_dump(config(scheme, integ), f)
         tmp = f.name
     try:
         block = MeshBlock(MeshBlockOptions.from_yaml(tmp))
@@ -132,9 +132,9 @@ def run(scheme, dt, w0, nstep, device):
             block.forward(block_vars, dt, stage)
         u = block_vars["hydro_u"][interior]
         if not torch.isfinite(u).all():
-            return False, n, wmax, float("nan")
+            return False, n, wmax, float("nan"), None
         wmax = max(wmax, (u[kIV1] / u[kIDN]).abs().max().item())
-    return True, nstep, wmax, (epe() - e0) / abs(e0)
+    return True, nstep, wmax, (epe() - e0) / abs(e0), u[kIV1] / u[kIDN]
 
 
 def main():
@@ -154,7 +154,7 @@ def main():
     for scheme, sname in SCHEMES:
         for dt, w0_moving in RUNGS:
             for w0 in (0.0, w0_moving):
-                finite, n, wmax, drift = run(scheme, dt, w0, args.nstep, args.device)
+                finite, n, wmax, drift, _ = run(scheme, dt, w0, args.nstep, args.device)
                 case = "%-11s Courant %5.1f w0 %4.1f" % (sname, cs * dt / DZ, w0)
                 print("%s  steps %d  max|w| %.3e m/s  E+PE drift %.2e" % (case, n, wmax, drift))
                 if not finite:
@@ -163,6 +163,14 @@ def main():
                     failures.append("%s: max|w| = %.3e m/s (tol %.0e)" % (case, wmax, W_TOL))
                 elif not abs(drift) < EPE_TOL:
                     failures.append("%s: E+PE drift %.2e (tol %.0e)" % (case, drift, EPE_TOL))
+    # rk3s4 weights the implicit solve by its own stages: no less accurate than rk3
+    w = {(g, k): run(9, DZ / cs / k, 1.e-3, 16 * k, args.device, g)[4] for g, k in
+         (("rk3", 32), ("rk3", 4), ("rk3", 8), ("rk3s4", 4), ("rk3s4", 8))}
+    e = {gk: float((x - w["rk3", 32]).norm() / w["rk3", 32].norm()) for gk, x in w.items()}
+    print("w error vs rk3 at Courant 1/32: rk3 %.4e %.4e, rk3s4 %.4e %.4e (Courant 1/4, 1/8)"
+          % (e["rk3", 4], e["rk3", 8], e["rk3s4", 4], e["rk3s4", 8]))
+    if math.log2(e["rk3s4", 4] / e["rk3s4", 8]) < math.log2(e["rk3", 4] / e["rk3", 8]):
+        failures.append("rk3s4 converges slower than rk3 with implicit-scheme 9")
     for f in failures:
         print("FAIL", f)
     return 1 if failures else 0

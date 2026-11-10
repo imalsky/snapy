@@ -44,6 +44,6 @@ integration:
 scalar:
   nvar: 2
   names: [hat, complement]
-  reconstruct: {type: weno5, scale: true, shock: true}
+  reconstruct: {type: weno5, shock: true}
   riemann-solver: {type: upwind}
   upper-bound: 1.0

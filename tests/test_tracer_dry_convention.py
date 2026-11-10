@@ -15,6 +15,9 @@ is never vacuous. A combined arm runs production's scheme 9 with relax-bot-comp 
 
 Limit: a UNIFORM tracer checks that tracer and dry air stay consistent; it cannot see a wrong donor
 or upwind choice in tracer transport.
+  donor    one tracer cell under a pressure bump: the implicit transfer must not overdraw the empty donor.
+  through  a uniform tracer in one column, dt x10: the solve moves over a cell mass through a cell,
+           so a donor limit must credit the inflow from below (r stays uniform).
 
   python test_tracer_dry_convention.py [--device cuda] [--yaml PATH]
 """
@@ -191,6 +194,54 @@ def main():
     if not dev < TOL:
         failures.append(
             f"combined (scheme 9 + relax + limiter): uniform tracer departed by {dev:.3e}")
+
+    # ---- donor: the implicit transfer never overdraws a near-empty tracer donor ----
+    from snapy import kIPR
+    cfg = yaml.safe_load(yaml.safe_dump(base))
+    cfg["integration"]["implicit-scheme"] = 1
+    cfg["geometry"]["bounds"]["x2max"] = 4.0e4  # a longer dt: up to 0.886 cell masses move
+    block = make_block(cfg, args.device)
+    w, r = initial_state(block, cfg, moving=False)
+    w[kIPR][..., 3 + 14] *= 2.0  # the bump pushes air up through cell 13, which holds no tracer
+    r.zero_()
+    r[..., 3 + 12] = R0
+    v, _ = block.initialize({"hydro_w": w, "scalar_r": r})
+    I, s_min = interior(cfg), math.inf
+    total0 = float(v["scalar_s"][I].sum())
+    for _ in range(2):
+        dt = block.max_time_step(v)
+        for stage in range(len(block.intg.stages)):
+            block.forward(v, dt, stage)
+            s_min = min(s_min, float(v["scalar_s"][I].min()))
+    total_dev = abs(float(v["scalar_s"][I].sum()) / total0 - 1.0)
+    print(f"donor   : min s={s_min:.3e}  |total tracer change|={total_dev:.3e}")
+    if not (s_min >= 0.0 and total_dev < TOL):
+        failures.append(f"donor: min s {s_min:.3e}, total tracer change {total_dev:.3e}")
+
+    # ---- through: a uniform tracer stays uniform when over a cell mass passes through a cell ----
+    from snapy import kIV1
+    cfg = yaml.safe_load(yaml.safe_dump(base))
+    cfg["integration"]["implicit-scheme"] = 1
+    cfg["geometry"]["cells"]["nx2"], cfg["geometry"]["bounds"]["x2max"] = 1, 1.0e4
+    block = make_block(cfg, args.device)
+    w, r = initial_state(block, cfg, moving=False)
+    dz = float(cfg["geometry"]["bounds"]["x1max"]) / cfg["geometry"]["cells"]["nx1"]
+    z = (torch.arange(w.size(-1), dtype=torch.float64, device=w.device) - 3 + 0.5) * dz
+    w[kIPR] *= (1.0 + 2.0 * torch.exp(-(((z - 16.5 * dz) / (4.0 * dz)) ** 2) / 2)).view(1, 1, -1)
+    v, _ = block.initialize({"hydro_w": w, "scalar_r": r})
+    I = (slice(None), slice(None), slice(None), slice(3, -3))  # x1 is the only ghosted axis
+    M = next(b for k, b in dict(block.named_buffers()).items() if k.endswith("mass_corr"))
+    vol = dz * 1.0e4 * float(cfg["geometry"]["bounds"]["x3max"]) / cfg["geometry"]["cells"]["nx3"]
+    r0, dt = v["scalar_s"][I] / v["hydro_u"][kIDN][I[1:]], block.max_time_step(v) * 10.0
+    dev, moved = 0.0, 0.0
+    for stage in range(len(block.intg.stages)):
+        cell = v["hydro_u"][kIDN][I[1:]] * vol
+        block.forward(v, dt, stage)
+        moved = max(moved, float((M[kIV1 + 1][I[1:]].abs() / cell).max()))
+        dev = max(dev, float((v["scalar_s"][I] / (v["hydro_u"][kIDN][I[1:]] * r0) - 1).abs().max()))
+    print(f"through : max|r/r0-1|={dev:.3e}  max implicit transfer / cell mass={moved:.3e}")
+    if not (dev <= 1.0e-14 and moved > 1.0):
+        failures.append(f"through: r departed by {dev:.3e} with {moved:.3e} cell masses moved")
 
     if failures:
         for msg in failures:

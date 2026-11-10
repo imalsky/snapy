@@ -190,9 +190,9 @@ class HydroImpl : public torch::nn::Cloneable<HydroImpl> {
   //! read once from SNAP_FLUX_COVARIANCE; on unless set to 0/false/off/no
   //! (or empty)
   static bool flux_covariance();
-  //! fourth-order, cell/face-consistent x1 reference density (and on
-  //! non-uniform x1 the reference cell pressure) for the well-balanced
-  //! reconstruction (#289); read once from SNAP_WB_REF4, off unless it is set
+  //! fourth-order, cell/face-consistent x1 reference density for the
+  //! well-balanced reconstruction (#289); read once from SNAP_WB_REF4, off
+  //! unless it is set
   static bool wb_ref4();
   //! subtract the x1 rho-w covariance dz^2/12 rho_1 w_1 / rho from the
   //! reconstructed cell velocity? read once from SNAP_X1_MASS_COVARIANCE; off

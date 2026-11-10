@@ -1,4 +1,5 @@
 // C/C++
+#include <cstdlib>
 #include <map>
 #include <sstream>
 
@@ -240,7 +241,10 @@ void ProcessGroupContext::_init_gloo() {
   }
 
   auto opts = c10d::ProcessGroupGloo::Options::create();
-  opts->devices.push_back(c10d::ProcessGroupGloo::createDefaultDevice());
+  const char* iface = std::getenv("GLOO_SOCKET_IFNAME");
+  opts->devices.push_back(
+      iface && *iface ? c10d::ProcessGroupGloo::createDeviceForInterface(iface)
+                      : c10d::ProcessGroupGloo::createDefaultDevice());
 
   auto backend_gloo = c10::static_intrusive_pointer_cast<c10d::Backend>(
       c10::make_intrusive<c10d::ProcessGroupGloo>(

@@ -30,6 +30,7 @@ setup_test(test_rectify)
 setup_test(test_flip_zero_count)
 setup_test(test_cubed_sphere_exchange)
 setup_test(test_coordinate)
+setup_test(test_cp5_nghost)
 setup_test(test_stretched_x1)
 setup_test(test_deck_x1_wiring)
 setup_test(test_stretched_x1_ref)
@@ -38,7 +39,7 @@ foreach(_arm "wb_ref4;SNAP_WB_REF4=1" "x1_centroid;SNAP_X1_CENTROID_EXACT=1")
   list(GET _arm 1 _env)
   add_test(NAME test_stretched_x1_ref_${_name}.${buildl}
            COMMAND test_stretched_x1_ref.${buildl}
-                   --gtest_filter=StretchedX1Ref.refuses_wb_ref4_switch:StretchedX1Ref.balance_column_refuses_wb_ref4)
+                   --gtest_filter=StretchedX1Ref.wb_ref4_switch_runs:StretchedX1Ref.balance_column_wb_ref4_runs)
   set_tests_properties(test_stretched_x1_ref_${_name}.${buildl}
                        PROPERTIES ENVIRONMENT "${_env}")
 endforeach()
@@ -49,7 +50,7 @@ set_tests_properties(test_stretched_x1_ref_radial_exact_off.${buildl}
                      PROPERTIES ENVIRONMENT "SNAP_GRAVITY_WORK_RADIAL_EXACT=0")
 add_test(NAME test_stretched_x1_ref_x1_mass_covariance.${buildl}
          COMMAND test_stretched_x1_ref.${buildl}
-                 --gtest_filter=StretchedX1Ref.refuses_x1_mass_covariance_switch)
+                 --gtest_filter=StretchedX1Ref.x1_mass_covariance_switch_runs)
 set_tests_properties(
   test_stretched_x1_ref_x1_mass_covariance.${buildl}
   PROPERTIES ENVIRONMENT "SNAP_X1_MASS_COVARIANCE=1"
@@ -229,6 +230,14 @@ setup_test(test_two_cards_species)
 setup_test(test_forcing)
 setup_parallel_test(test_exchange 2)
 setup_parallel_test(test_output_barrier 2)
+# The Gloo device must honor the selected interface rather than resolve the host.
+add_test(NAME test_gloo_invalid_interface.${buildl}
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/expect_gloo_invalid_interface.py
+    torchrun --local-addr=127.0.0.1 --no-python --nproc-per-node=2
+    $<TARGET_FILE:test_output_barrier.${buildl}>)
+set_tests_properties(test_gloo_invalid_interface.${buildl}
+  PROPERTIES ENVIRONMENT "BACKEND=gloo;GLOO_SOCKET_IFNAME=snapy_no_such_interface"
+    TIMEOUT 60)
 setup_parallel_test(test_check_redo_parallel 2)
 setup_parallel_test(test_cycle_diagnostics_parallel 2)
 if(APPLE)  # Gloo is the Mac backend; Linux runs UCX
@@ -386,8 +395,16 @@ set_tests_properties(test_flux_positivity_cubedsphere_flux_covariance_python
                      PROPERTIES ENVIRONMENT "SNAP_FLUX_COVARIANCE=1")
 snapy_add_python_test(test_flux_positivity_cubedsphere_moist TIMEOUT 300
                       LABELS "python;positivity;cubed-sphere")
+snapy_add_python_test(test_roe_cubed_sphere_rest TIMEOUT 120
+                      LABELS "python;riemann;cubed-sphere")
 snapy_add_python_test(test_cubed_sphere_cell_volume TIMEOUT 120
                       LABELS "python;coordinate;cubed-sphere")
+snapy_add_python_test(test_stage2_cubed_stretched ARGS --device cpu TIMEOUT 3600
+                      LABELS "python;coordinate;cubed-sphere;stage2")
+if(CUDA)
+  snapy_add_python_test(test_stage2_cubed_stretched_cuda SCRIPT test_stage2_cubed_stretched.py
+                        ARGS --device cuda TIMEOUT 3600 LABELS "python;coordinate;cubed-sphere;stage2")
+endif()
 snapy_add_python_test(test_outflow_stale_ghosts TIMEOUT 120
                       LABELS "python;boundary;implicit;cubed-sphere")
 snapy_add_python_test(test_tracer_dry_convention TIMEOUT 120 LABELS "python;scalar;implicit;forcing")
@@ -406,8 +423,16 @@ snapy_add_python_test(test_flux_covariance_seams TIMEOUT 300
 snapy_add_python_test(test_flux_covariance_rowset TIMEOUT 300 LABELS "python;hydro")
 snapy_add_python_test(test_wb_ref4_order TIMEOUT 300 LABELS "python;hydro")
 snapy_add_python_test(test_x1_centroid_rest TIMEOUT 300 LABELS "python;hydro")
+snapy_add_python_test(test_radial_order TIMEOUT 300 LABELS "python;hydro")
+snapy_add_python_test(test_radial_order_x1_centroid SCRIPT test_radial_order.py
+                      ARGS --x1-centroid TIMEOUT 300 LABELS "python;hydro")
 # #289: a passive scalar and the same tracer as a hydro species, covariance on and off
 snapy_add_python_test(test_scalar_flux_covariance TIMEOUT 300 LABELS "python;hydro;scalar")
+snapy_add_python_test(test_scalar_stratified TIMEOUT 300 LABELS "python;scalar")
+# upper-bound must not drive a donor negative
+snapy_add_python_test(test_scalar_upper_bound_donor TIMEOUT 300 LABELS "python;scalar")
+# tracer and species ratios under the species positivity limiter (#338)
+snapy_add_python_test(test_tracer_ratio TIMEOUT 120 LABELS "python;hydro;scalar;positivity")
 # #289: the same, on a column split in x1, four blocks in one process vs one
 snapy_add_python_test(test_scalar_cov_x1_split TIMEOUT 300 LABELS "python;hydro;scalar")
 set_tests_properties(test_scalar_cov_x1_split_python
@@ -442,6 +467,8 @@ if(CUDA)
   snapy_add_python_test(test_flux_positivity_cubedsphere_moist_cuda
     SCRIPT test_flux_positivity_cubedsphere_moist.py ARGS --device cuda
     TIMEOUT 300 LABELS "python;positivity;cubed-sphere;cuda")
+  snapy_add_python_test(test_implicit_face_work_operator_cuda SCRIPT test_implicit_face_work_operator.py
+    ARGS --device cuda TIMEOUT 300 LABELS "python;hydro;implicit;gravity;cuda")
   snapy_add_python_test(test_vic_moist_device
     TIMEOUT 120 LABELS "python;implicit;cuda")
   snapy_add_python_test(test_wb_ref4_order_cuda
@@ -450,12 +477,25 @@ if(CUDA)
   snapy_add_python_test(test_x1_centroid_rest_cuda
     SCRIPT test_x1_centroid_rest.py ARGS --device cuda
     TIMEOUT 300 LABELS "python;hydro;cuda")
+  snapy_add_python_test(test_radial_order_cuda
+    SCRIPT test_radial_order.py ARGS --device cuda TIMEOUT 300 LABELS "python;hydro;cuda")
+  snapy_add_python_test(test_radial_order_x1_centroid_cuda SCRIPT test_radial_order.py
+    ARGS --device cuda --x1-centroid TIMEOUT 300 LABELS "python;hydro;cuda")
   snapy_add_python_test(test_gravity_work_radial_exact_cuda
     SCRIPT test_gravity_work_radial_exact.py ARGS --device cuda
     TIMEOUT 300 LABELS "python;hydro;gravity;cuda")
   snapy_add_python_test(test_scalar_flux_covariance_cuda
     SCRIPT test_scalar_flux_covariance.py ARGS --device cuda
     TIMEOUT 300 LABELS "python;hydro;scalar;cuda")
+  snapy_add_python_test(test_scalar_upper_bound_donor_cuda
+    SCRIPT test_scalar_upper_bound_donor.py ARGS --device cuda
+    TIMEOUT 300 LABELS "python;scalar;cuda")
+  snapy_add_python_test(test_tracer_ratio_cuda
+    SCRIPT test_tracer_ratio.py ARGS --device cuda
+    TIMEOUT 120 LABELS "python;hydro;scalar;positivity;cuda")
+  snapy_add_python_test(test_tracer_dry_convention_cuda
+    SCRIPT test_tracer_dry_convention.py ARGS --device cuda
+    TIMEOUT 120 LABELS "python;scalar;implicit;forcing;cuda")
   # the fused passive-scalar path (SNAP_SCALAR_FUSED=1) against the default path: the flow and the PLM case
   # bit for bit, the WENO5 cases to round-off
   snapy_add_python_test(test_scalar_fused
@@ -476,8 +516,13 @@ if(CUDA)
     test_vic_moist_device_python
     test_wb_ref4_order_cuda_python
     test_x1_centroid_rest_cuda_python
+    test_radial_order_cuda_python
+    test_radial_order_x1_centroid_cuda_python
     test_gravity_work_radial_exact_cuda_python
     test_scalar_flux_covariance_cuda_python
+    test_scalar_upper_bound_donor_cuda_python
+    test_tracer_ratio_cuda_python
+    test_tracer_dry_convention_cuda_python
     test_scalar_fused_python
     test_scalar_cov_x1_split_fused_cuda_python
     PROPERTIES SKIP_RETURN_CODE 125)

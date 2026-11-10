@@ -130,24 +130,22 @@ exchange, so a column split along x1 gets the same faces as one block. The in-pr
 
 ## 5. Non-uniform x1 grids: the cell pressure
 
-The log-mean is exact only for an isothermal cell. With the switch, on a non-uniform grid the cell pressure is
-the cell average of the cubic through the four face pressures at faces $i-1..i+2$ (window inside the owned
-faces at a clamped wall), evaluated by three-point Gauss-Legendre, which is exact for a cubic (check 6). The
-kernel's guard is kept: a value outside $[\min, \max]$ of the cell's two face pressures keeps the log-mean.
-On a uniform grid the six-face $p_{\rm ref}$ is kept as it is.
-
-This moves the discrete fixed point of a non-uniform column by $O(\Delta z^2)$. `balance_column` therefore
-iterates against the switched $p_{\rm ref}$ when the switch is set (the density reference does not enter
-there), so a balanced column is the fixed point the solver enforces.
+A keyed stretched x1 (`cells/x1rat` or `geometry/x1f`, #280) already has a
+sixth-order cell pressure: the cell average of the degree-5 interpolant through six faces, built from the
+widths (#280 (iv)). There the switch keeps it, so REF4 contributes only the density reference of section 3
+and the face density of section 4, and `balance_column` does not run REF4: the stretched rest state is the
+same with the switch on or off. $F$ stays in cell-index units; on a keyed
+stretched family the measured order of $N^2_{\rm eff}$ is 4.06/4.04 (1 e-fold) and 3.78/3.89 (3 e-folds) at
+$h_{\max}/h_{\min} = 4$. On a Cartesian x1 `SNAP_X1_CENTROID_EXACT` has no content of its own and runs as
+`SNAP_WB_REF4`.
 
 ## 6. Exact discrete balance is kept
 
 At rest $p' = $ const, so $p_L = p_R = p_{\rm sf} + c$, $\bar u = 0$ and the LMARS face pressure is
 $p_{\rm sf} + c$; the momentum-flux difference across cell $i$ is $g\bar\rho_i\Delta z_i$ and cancels the gravity
 source exactly. The density reference is not part of this pairing: with $\bar u = 0$ the mass flux and the
-face gravity work vanish whatever the face density is. The fix never changes $p_{\rm sf}$; on a uniform grid
-it never changes $p_{\rm ref}$, so the discrete rest state $\bar p = p_{\rm ref} + c$ is the base's; on a
-non-uniform grid it is the switched one, found by `balance_column` as above.
+face gravity work vanish whatever the face density is. The fix never changes $p_{\rm sf}$ or $p_{\rm ref}$, so
+the discrete rest state $\bar p = p_{\rm ref} + c$ is the base's.
 
 Why $p_{\rm ref} = \bar p + c + O(\Delta z^6)$ on a hydrostatic background: the scan gives
 $p_{{\rm sf},i-1/2} - p_{{\rm sf},i+1/2} = g\bar\rho_i\Delta z_i = \int_{\rm cell} g\rho\,dz$ exactly, so the scan
@@ -257,15 +255,13 @@ different projection), so its numbers are not comparable digit by digit with the
 What this implementation adds over 473db21: the face part after the seam exchange (473db21 built faces before
 it, one-sided at block ends, so a split column could differ from one block); the per-cell resolution flag
 instead of a whole-column 2-cells-per-$H$ test; the range guards of the spec with the $10^{-10}$ margin;
-physical-spacing face weights; the non-uniform cell pressure with `balance_column` following it.
+physical-spacing face weights.
 
 ## 11. Tests that pin the kernel's reference
 
 Both run unchanged with the switch off and a second time with it set (`*_wb_ref4` ctests):
 
-- `test_balance_column`: on the stretched column the switch moves the fixed point, and `balance_column` finds
-  the switched one; the residual audit now applies the same switched cell pressure (against the kernel's
-  alone the balanced column reads $1.6\times10^{-3}$ instead of $< 10^{-10}$).
+- `test_balance_column`: the switch changes no cell pressure, so the balanced columns are the kernel's.
 - `test_face_floor`: with the switch the density reference follows the dipped cell, so $\rho'$ stays small,
   the reconstructed face densities either side stay positive (about $1.4\times10^{-8}$ and $5.6\times10^{-8}$,
   where the kernel's reference gives $-4.2\times10^{-8}$) and the floor does not fire; the switched mass and
@@ -274,6 +270,5 @@ Both run unchanged with the switch off and a second time with it set (`*_wb_ref4
 ## 12. Not covered
 
 - The $r^2$-measure (spherical-polar, cubed-sphere) version of sections 3-5.
-- Non-uniform x1 is exercised only through `balance_column` and its test; no stretched-grid dynamics test.
 - Multi-species columns use the dry-density channel, as the kernel does; untested with the switch.
 - Multi-process x1 seams are covered only by the in-process split test.

@@ -45,7 +45,7 @@ def main() -> int:
         "tau": 1.e-4, "species": ["vapor"], "xfrac": [1.],
     }}
     card["scalar"]["reconstruct"] = {
-        "type": "plm", "scale": False, "shock": False,
+        "type": "plm", "shock": False,
     }
 
     with tempfile.TemporaryDirectory(prefix="snapy-case-m-") as directory:

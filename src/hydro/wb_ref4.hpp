@@ -6,8 +6,7 @@
 namespace snap {
 
 //! #289 (SNAP_WB_REF4): fourth-order x1 reference DENSITY for the
-//! well-balanced reconstruction, consistent between cell and face, and on
-//! non-uniform x1 grids a fourth-order cell reference pressure. The face
+//! well-balanced reconstruction, consistent between cell and face. The face
 //! pressures (the hydrostatic scan) are never changed. Applied after the
 //! kernel (hydro_ref_x1_impl.h); a guarded cell or face keeps the kernel's
 //! value. See docs/derivations/wb-ref4.md.
@@ -19,7 +18,6 @@ bool wb_ref4_enabled();
 //! reference's device and dtype
 struct WbRef4Stencils {
   int is = 0, iu = -1, nc1 = 0;
-  bool uniform = true;
   //! false: a clamped wall with fewer than four owned cells; nothing changes
   bool usable = false;
   //! a physical x1 wall whose stencils stay inside the owned cells
@@ -29,9 +27,6 @@ struct WbRef4Stencils {
   torch::Tensor fidx, fwt;
   //! range-guard neighbours i-1, i, i+1 of each owned cell: (nown, 3)
   torch::Tensor nidx;
-  //! non-uniform only: cell average of the cubic through four face
-  //! pressures, (nown, 4) face indices and weights
-  torch::Tensor pidx, pwt;
   //! face density: derivative at the face of the quartic primitive through
   //! five faces (four cells), (nown + 1, 4) cell indices and weights
   torch::Tensor aidx, awt;
@@ -47,11 +42,11 @@ struct WbRef4Stencils {
 
 //! x1f: the nc1 + 1 face positions; is/iu: first/last owned cell
 WbRef4Stencils wb_ref4_stencils(torch::Tensor const& x1f, int is, int iu,
-                                bool uniform, bool clamp_in, bool clamp_out,
+                                bool clamp_in, bool clamp_out,
                                 torch::TensorOptions const& options);
 
-//! cell part, before any x1 seam exchange of (pref, dref): pref (non-uniform
-//! grids only) and dref of the owned cells, in place. Returns the resolution
+//! cell part, before any x1 seam exchange of (pref, dref): dref of the owned
+//! cells, in place. Returns the resolution
 //! flag (nc3, nc2, nc1): cells (dilated by two) where the column has fewer
 //! than two cells per pressure scale height and the kernel's values stay.
 torch::Tensor wb_ref4_cells(WbRef4Stencils const& st, torch::Tensor const& w,

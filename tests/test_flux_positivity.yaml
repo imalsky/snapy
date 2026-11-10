@@ -70,4 +70,4 @@ integration:
 scalar:
   nvar: 1
   names: [tracer]
-  reconstruct: {type: cp5, scale: false, shock: false}
+  reconstruct: {type: cp5, shock: false}

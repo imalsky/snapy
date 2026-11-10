@@ -50,7 +50,7 @@ dynamics:
 scalar:
   nvar: %d
   names: %s
-  reconstruct: {type: %s, scale: false, shock: false}
+  reconstruct: {type: %s, shock: false}
 integration:
   type: rk3
   cfl: 0.4

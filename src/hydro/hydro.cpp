@@ -25,7 +25,6 @@ HydroImpl::HydroImpl(const HydroOptions& options_, torch::nn::Module* p)
 
 void HydroImpl::reset() {
   TORCH_CHECK(pmb, "[Hydro] Parent MeshBlock is null");
-  bool stretched = pmb->pcoord && pmb->pcoord->options->stretched_x1();
 
   //// ---- (1) set up equation-of-state model ---- ////
   peos = EquationOfStateImpl::create(options->eos(), this);
@@ -33,19 +32,17 @@ void HydroImpl::reset() {
     SINFO(Hydro) << "EOS type: " << peos->options->type() << "\n";
   }
 
-  TORCH_CHECK(!(stretched && wb_ref4_enabled()),
-              "SNAP_WB_REF4 (or SNAP_X1_CENTROID_EXACT, which implies it) is "
-              "not supported on a stretched x1 (geometry/x1f or cells/x1rat, "
-              "#280); unset it");
-
-  TORCH_CHECK(!(stretched && x1_mass_covariance()),
-              "SNAP_X1_MASS_COVARIANCE is not supported on a stretched x1 "
-              "(geometry/x1f or cells/x1rat, #280); unset it");
-
   //// ---- (3) set up reconstruction-x1 model ---- ////
   precon1 = ReconstructImpl::create(options->recon1(), this, "recon1");
-  if (stretched) {
-    precon1->set_x1_faces(pmb->pcoord->x1f);
+  if (pmb->pcoord) {
+    auto const& co = pmb->pcoord->options;
+    // SNAP_X1_CENTROID_EXACT hands this module plain means (hydro_forward.cpp)
+    bool plain = x1_centroid_exact_enabled() && co->type() == "spherical-polar";
+    auto x1f =
+        !plain ? pmb->pcoord->x1_row_faces(options->recon1()->interp()->type())
+        : co->stretched_x1() ? pmb->pcoord->x1f
+                             : torch::Tensor();
+    if (x1f.defined()) precon1->set_x1_faces(x1f);
   }
   if (options->verbose()) {
     SINFO(Hydro) << "Reconstruction-x1 type: "
@@ -612,8 +609,8 @@ HydroImpl::_hydro_ref_x1(torch::Tensor const& w) const {
       w.device().type(), w, dx1f, anchor, psf_lo, psf_hi, pref, dsf, dref, iu,
       g, x1_grid, phys_in, phys_out, options->wb_wall_clamp(), rows);
 
-  // #289 (SNAP_WB_REF4): the cell part of the fourth-order density reference
-  // (and on non-uniform x1 the cell pressure), before the seam exchange below
+  // #289 (SNAP_WB_REF4): the cell part of the fourth-order density reference,
+  // before the seam exchange below
   // so that the exchanged ghost rows carry it; the face part follows the
   // exchange. psf is never changed, so the rest balance is the kernel's.
   // SNAP_X1_CENTROID_EXACT implies the switch (wb_ref4_enabled()): on
@@ -624,8 +621,8 @@ HydroImpl::_hydro_ref_x1(torch::Tensor const& w) const {
     if (!wb_ref4_ || wb_ref4_->stale(w)) {
       bool clamp = options->wb_wall_clamp();
       wb_ref4_ = std::make_shared<WbRef4Stencils>(
-          wb_ref4_stencils(pcoord->x1f, is, iu, x1_uniform_ == 1,
-                           clamp && phys_in, clamp && phys_out, w.options()));
+          wb_ref4_stencils(pcoord->x1f, is, iu, clamp && phys_in,
+                           clamp && phys_out, w.options()));
     }
     wb4_flag = wb_ref4_cells(*wb_ref4_, w, psf_lo, psf_hi, pref, dref);
   }

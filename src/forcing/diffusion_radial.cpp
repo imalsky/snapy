@@ -46,8 +46,8 @@ void DiffusionImpl::radial_conduction_step(torch::Tensor u, double dt) {
   auto rm = rf.slice(0, 0, n), rp = rf.slice(0, 1, n + 1);
   // Use the same radial volume measure as Coordinate::cell_volume, including
   // its cancellation-safe global cell widths in a very thin shell.
-  auto mass = capacity * c->dx1f.to(u.options()).slice(0, start, start + n) *
-              (rp.square() + rp * rm + rm.square()) / 3.;
+  auto h = c->dx1f.to(u.options()).slice(0, start, start + n);
+  auto mass = capacity * h * (rp.square() + rp * rm + rm.square()) / 3.;
   auto conductance =
       torch::zeros({temp.size(0), temp.size(1), n + 1}, u.options());
   auto rl = r.slice(0, 0, n - 1), rr = r.slice(0, 1, n);
@@ -60,7 +60,9 @@ void DiffusionImpl::radial_conduction_step(torch::Tensor u, double dt) {
         side ? options->temperature_outer() : options->temperature_inner();
     if (tw == 0.) continue;
     int near = side ? n - 1 : 0, next = side ? n - 2 : 1, face = side ? n : 0;
-    auto kn = k.select(-1, near), kf = 1.5 * kn - 0.5 * k.select(-1, next);
+    // linear in position over the cell widths (#280; 1.5, -0.5 if uniform)
+    auto g = h[near] / (h[near] + h[next]);
+    auto kn = k.select(-1, near), kf = (1. + g) * kn - g * k.select(-1, next);
     kf = torch::where(kf >= 0., kf, kn);
     auto value = kf * rf[face] * r[near] / torch::abs(r[near] - rf[face]);
     conductance.select(-1, face).copy_(value);
