@@ -146,12 +146,15 @@ face-flux covariance correction (`SNAP_FLUX_COVARIANCE`, #289;
 `SNAP_FLUX_COVARIANCE=0` (or `false`, `off`, `no`) to turn it off.
 `SNAP_SCALAR_FUSED=1` moves passive-scalar transport on CUDA (float64) into a
 few fused kernels (`src/scalar/scalar_fused.cu`): bit for bit the default path,
-except the WENO5 reconstruction, whose weights take fewer divisions and differ
-at round-off. It is off by default. The upper-bound limiter, a column split in
-x1 with the flux covariance, and x1 columns longer than 1024 cells keep the
-default code; any other part that cannot run fused (CPU or non-float64
-tensors, a reconstruction other than WENO5) warns once, and a WENO5 table other
-than the uniform-grid one is refused.
+except the WENO5 reconstruction of the tracer mass, whose weights take fewer
+divisions and differ at round-off. It is off by default. The dry density's
+faces and the face ratio, the upper-bound blend, the positivity limiter's
+donor-share correction and the implicit transfer's donor sweep run the default
+code on both paths. A part that cannot run fused warns once and runs the
+default code: x1 with per-face rows (a stretched or radial x1, so every
+spherical WENO5 deck), the lateral flux of a column split in x1 with the flux
+covariance, CPU or non-float64 tensors, a reconstruction other than WENO5. A
+WENO5 table other than the uniform-grid one is refused.
 
 ## Development
 

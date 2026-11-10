@@ -44,7 +44,7 @@ void scalar_divergence_unsupported(torch::Tensor&, torch::Tensor&,
 }
 void scalar_weno5_unsupported(torch::Tensor&, torch::Tensor const&,
                               torch::Tensor const&, torch::Tensor const&, bool,
-                              int, torch::Tensor const&) {
+                              int) {
   TORCH_CHECK(false, "the fused scalar path runs on CUDA devices only");
 }
 void scalar_implicit_transfer_unsupported(torch::Tensor&, torch::Tensor const&,

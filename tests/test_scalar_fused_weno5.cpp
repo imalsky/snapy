@@ -5,9 +5,8 @@
 // to the subnormals and up to 1e300, zero, fronts of large contrast, a huge
 // spike, nearly
 // constant lines (smoothness indicators near the 1e-6 epsilon), oscillation,
-// negative values, NaN and Inf. Along x1, x2 and x3, as face states and as the
-// x1 upwind flux, on lines up to 1024 cells and longer (the long x1 flux keeps
-// the default arithmetic); fp64 with and without scaling, and fp32 with
+// negative values, NaN and Inf. Along x1, x2 and x3, as face states, on lines
+// up to 1024 cells and longer; fp64 with and without scaling, and fp32 with
 // subnormal values. Each finite value must agree to round-off relative to the
 // largest finite input within 4 cells along the line (so a low plateau beside
 // a front is judged on its own scale), and NaN and Inf must appear where the
@@ -118,7 +117,7 @@ void check(Reconstruct rec, torch::Tensor w, int dim, bool scale, double tol,
   auto ref = rec->forward(w, dim);
   auto faces = torch::empty_like(ref);
   at::native::call_scalar_weno5(dev.type(), faces, w, weno5->cm, weno5->cp,
-                                scale, dim, torch::Tensor());
+                                scale, dim);
   // with scaling the default formula overflows on the 1e300 plateau (the
   // scale times the unnormalised weighted sum); the kernel forms the quotient
   // first, so its faces must be the plateau itself
@@ -128,24 +127,6 @@ void check(Reconstruct rec, torch::Tensor w, int dim, bool scale, double tol,
     auto huge = faces.select(1, HUGE_VAR).cpu();
     EXPECT_TRUE(torch::isfinite(huge).all().item<bool>()) << tag;
     EXPECT_LE(((huge - 1e300).abs() / 1e300).max().item<double>(), tol) << tag;
-  }
-  if (dim == 3) {
-    auto vel = torch::sin(
-        torch::arange(w[0].numel(), w.options()).view(w[0].sizes()) * 0.7);
-    auto u = (vel > 0).to(w.scalar_type());
-    auto flux_ref = vel * (u * ref[ILT] + (1. - u) * ref[IRT]);
-    auto flux = torch::empty_like(w);
-    at::native::call_scalar_weno5(dev.type(), flux, w, weno5->cm, weno5->cp,
-                                  scale, dim, vel.contiguous());
-    // x1 columns longer than 1024 cells keep the default arithmetic
-    int skip_flux = w.size(3) <= 1024 ? skip : -1;
-    expect_close(flux_ref, flux, lmax * vel.abs().unsqueeze(0), tol,
-                 tag + " upwind flux", skip_flux);
-    if (skip_flux >= 0) {
-      auto want = (vel * 1e300).cpu();
-      auto got = flux.select(0, HUGE_VAR).cpu();
-      EXPECT_LE(((got - want).abs() / 1e300).max().item<double>(), tol) << tag;
-    }
   }
 }
 
@@ -209,20 +190,14 @@ TEST(scalar_fused, weno5_refuses_other_tables) {
   auto weno5 = std::dynamic_pointer_cast<Weno5InterpImpl>(rec->pinterp1);
   ASSERT_TRUE(weno5);
   auto w = make_lines(20, 3).to(dev);
-  auto vel = torch::ones_like(w[0]);
   for (bool right : {false, true}) {
     auto cm = weno5->cm.clone();
     auto cp = weno5->cp.clone();
     (right ? cp : cm)[0][2] += 0.125;
     auto faces = torch::empty({2, NVAR, 3, 2, 20}, w.options());
     EXPECT_THROW(at::native::call_scalar_weno5(dev.type(), faces, w, cm, cp,
-                                               true, 3, torch::Tensor()),
+                                               true, 3),
                  c10::Error)
         << (right ? "cp" : "cm") << " changed, face states";
-    auto flux = torch::empty_like(w);
-    EXPECT_THROW(at::native::call_scalar_weno5(dev.type(), flux, w, cm, cp,
-                                               true, 3, vel),
-                 c10::Error)
-        << (right ? "cp" : "cm") << " changed, x1 upwind flux";
   }
 }

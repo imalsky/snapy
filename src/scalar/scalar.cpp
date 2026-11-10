@@ -115,8 +115,7 @@ torch::Tensor ScalarImpl::forward(double dt, torch::Tensor u,
     vec.insert(vec.begin(), 2);
     auto faces = torch::empty(vec, uc.options());
     at::native::call_scalar_weno5(faces.device().type(), faces, uc, weno5->cm,
-                                  weno5->cp, weno5->options->scale(), dim,
-                                  torch::Tensor());
+                                  weno5->cp, weno5->options->scale(), dim);
     return faces;
   };
 

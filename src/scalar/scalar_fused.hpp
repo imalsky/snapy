@@ -64,15 +64,11 @@ using scalar_divergence_fn = void (*)(
 //! ReconstructImpl::forward of a scalar with WENO5 along tensor dimension
 //! `dim` (3: x1, 2: x2, 1: x3): every face's left (ILT) and right (IRT) state
 //! with the same edge copies and the clamp at 0; the WENO5 weights take fewer
-//! divisions than the default path's (round-off differences; the x1 upwind
-//! flux of columns longer than 1024 cells keeps the default arithmetic).
-//! faces: (2, nvar, nc3, nc2, nc1). When `vel` is defined (x1 only) the
-//! kernel writes instead the upwind flux vel * (ui * wl + (1 - ui) * wr) into
-//! `faces` shaped (nvar, nc3, nc2, nc1).
+//! divisions than the default path's (round-off differences).
+//! faces: (2, nvar, nc3, nc2, nc1).
 using scalar_weno5_fn = void (*)(torch::Tensor& faces, torch::Tensor const& w,
                                  torch::Tensor const& cm,
-                                 torch::Tensor const& cp, bool scale, int dim,
-                                 torch::Tensor const& vel);
+                                 torch::Tensor const& cp, bool scale, int dim);
 DECLARE_DISPATCH(scalar_weno5_fn, call_scalar_weno5);
 
 //! MeshBlock's implicit x1 tracer transfer, added into ds:

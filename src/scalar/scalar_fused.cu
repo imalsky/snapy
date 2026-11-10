@@ -18,9 +18,6 @@
 
 #include "scalar_fused.hpp"
 
-// the WENO5 weights of the default path
-#include <snap/recon/interp_impl.cuh>
-
 namespace snap {
 
 namespace {
@@ -331,39 +328,6 @@ __global__ void scalar_divergence_kernel(
   ds[idx] = interior ? rmul(q, mdt) : T(0);
 }
 
-// The x1 upwind flux of columns longer than 1024 cells (too long for one
-// block of scalar_weno5_x1_flux_kernel), one thread per face element (scalar,
-// k, j, i), with the default path's arithmetic (bit for bit). Along x1 (size
-// n, element stride s, ghosts il = 3, iu = n - 3) the default path stores
-// right() of cell p - 1 as the left state of face p and left() of cell p as
-// its right state, for faces il..iu+1 and il-1..iu, then copies the edge
-// values outward: the cells used are clamp(p - 1, il - 1, iu - 1) and
-// clamp(p, il, iu).
-template <typename T>
-__global__ void scalar_weno5_long_flux_kernel(
-    T* __restrict__ out, T const* __restrict__ w, T const* __restrict__ cm,
-    T const* __restrict__ cp, bool scale, int64_t stride, int n, int64_t total,
-    int64_t ncell, T const* __restrict__ vel) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx >= total) return;
-  int p = static_cast<int>((idx / stride) % n);
-  int64_t base = idx - static_cast<int64_t>(p) * stride;
-  int il = 3, iu = n - 3;
-  int cl = min(max(p - 1, il - 1), iu - 1);
-  int cr = min(max(p, il), iu);
-  T sl[5], sr[5];
-#pragma unroll
-  for (int q = 0; q < 5; ++q) {
-    sl[q] = w[base + static_cast<int64_t>(cl - 2 + q) * stride];
-    sr[q] = w[base + static_cast<int64_t>(cr - 2 + q) * stride];
-  }
-  T wl = clamp0(interp_shared_weno5_coeff_impl(sl, cp, 0, 0, 5, scale));
-  T wr = clamp0(interp_shared_weno5_coeff_impl(sr, cm, 0, 0, 5, scale));
-  T v = vel[idx % ncell];
-  T u = v > T(0) ? T(1) : T(0);
-  out[idx] = rmul(v, radd(rmul(u, wl), rmul(rsub(T(1), u), wr)));
-}
-
 #define SQR(x) ((x) * (x))  // as interp_impl.cuh, which undefines it
 // The rows of Weno5InterpImpl::cm (the uniform-grid WENO5 table) as fma chains
 // over their nonzero entries, in index order. _vvdot<5> (interp_impl.cuh)
@@ -534,44 +498,12 @@ __global__ void scalar_weno5_faces_kernel(T* __restrict__ out,
   }
 }
 
-// x1 (contiguous) flux: one block per column; each cell's pair goes to shared
-// memory, then each face takes right() of the cell below and left() of the
-// cell above (with the edge copies) for the upwind flux.
-template <typename T>
-__global__ void scalar_weno5_x1_flux_kernel(T* __restrict__ flux,
-                                            T const* __restrict__ w, bool scale,
-                                            int n, int64_t ncolumn_cell,
-                                            T const* __restrict__ vel) {
-  extern __shared__ unsigned char smem_raw[];
-  T* sl = reinterpret_cast<T*>(smem_raw);
-  T* sr = sl + n;
-  int64_t col = blockIdx.x;
-  int64_t base = col * n;
-  int p = threadIdx.x;
-  int il = 3, iu = n - 3;
-  if (p >= il - 1 && p <= iu) {
-    T src[5];
-#pragma unroll
-    for (int q = 0; q < 5; ++q) src[q] = w[base + p - 2 + q];
-    T l, r;
-    weno5_pair(src, scale, l, r);
-    sl[p] = clamp0(l);
-    sr[p] = clamp0(r);
-  }
-  __syncthreads();
-  T wl = sr[min(max(p - 1, il - 1), iu - 1)];
-  T wr = sl[min(max(p, il), iu)];
-  T v = vel[(col % ncolumn_cell) * n + p];
-  T u = v > T(0) ? T(1) : T(0);
-  flux[base + p] = rmul(v, radd(rmul(u, wl), rmul(rsub(T(1), u), wr)));
-}
-
 void scalar_weno5_cuda(torch::Tensor& faces, torch::Tensor const& w,
                        torch::Tensor const& cm, torch::Tensor const& cp,
-                       bool scale, int dim, torch::Tensor const& vel) {
+                       bool scale, int dim) {
   at::cuda::CUDAGuard device_guard(w.device());
   char const* who = "scalar_weno5";
-  check_operands(who, w, {&faces, &vel});
+  check_operands(who, w, {&faces});
   TORCH_CHECK(w.dim() == 4 && w.is_contiguous() && faces.is_contiguous(), who,
               ": contiguous (nvar, nc3, nc2, nc1) expected");
   TORCH_CHECK(dim >= 1 && dim <= 3, who, ": dim 1, 2 or 3");
@@ -584,47 +516,19 @@ void scalar_weno5_cuda(torch::Tensor& faces, torch::Tensor const& w,
   int n = int_extent(w.size(dim), who);
   int64_t stride = w.stride(dim);
   int64_t total = w.numel();
-  bool upwind = vel.defined();
-  if (upwind) {
-    TORCH_CHECK(dim == 3 && vel.is_contiguous() &&
-                    vel.sizes() == w.sizes().slice(1) &&
-                    faces.sizes() == w.sizes(),
-                who,
-                ": the upwind form is x1 only, vel (nc3, nc2, nc1) and the "
-                "flux shaped like w");
-  } else {
-    std::vector<int64_t> two = {2};
-    two.insert(two.end(), w.sizes().begin(), w.sizes().end());
-    TORCH_CHECK(faces.sizes() == torch::IntArrayRef(two), who,
-                ": faces (2, nvar, nc3, nc2, nc1) expected");
-  }
+  std::vector<int64_t> two = {2};
+  two.insert(two.end(), w.sizes().begin(), w.sizes().end());
+  TORCH_CHECK(faces.sizes() == torch::IntArrayRef(two), who,
+              ": faces (2, nvar, nc3, nc2, nc1) expected");
   if (total == 0) return;
-  if (!upwind || n <= 1024) check_uniform_weno5(cm, cp, who);  // the fused kernels
-  int64_t ncell = total / w.size(0);
+  check_uniform_weno5(cm, cp, who);
   int threads = 256;
   int64_t blocks = flat_blocks(total, threads, who);
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "scalar_weno5_cuda", [&] {
-    if (upwind && n <= 1024) {
-      int64_t columns = total / n;
-      TORCH_CHECK(columns <= std::numeric_limits<int>::max(),
-                  "scalar_weno5: too many x1 columns for one grid");
-      size_t shared = 2 * static_cast<size_t>(n) * sizeof(scalar_t);
-      scalar_weno5_x1_flux_kernel<scalar_t><<<columns, n, shared, stream>>>(
-          faces.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(), scale, n,
-          ncell / n, vel.data_ptr<scalar_t>());
-    } else if (upwind) {
-      auto cmp = cm.to(w.scalar_type());
-      auto cpp = cp.to(w.scalar_type());
-      scalar_weno5_long_flux_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
-          faces.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(),
-          cmp.data_ptr<scalar_t>(), cpp.data_ptr<scalar_t>(), scale, stride, n,
-          total, ncell, vel.data_ptr<scalar_t>());
-    } else {
-      scalar_weno5_faces_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
-          faces.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(), scale, stride, n,
-          total);
-    }
+    scalar_weno5_faces_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+        faces.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(), scale, stride, n,
+        total);
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
