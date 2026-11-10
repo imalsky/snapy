@@ -64,7 +64,9 @@ using scalar_divergence_fn = void (*)(
 //! ReconstructImpl::forward of a scalar with WENO5 along tensor dimension
 //! `dim` (3: x1, 2: x2, 1: x3): every face's left (ILT) and right (IRT) state
 //! with the same edge copies and the clamp at 0; the WENO5 weights take fewer
-//! divisions than the default path's (round-off differences).
+//! divisions than the default path's (round-off differences; values whose
+//! weighted sum overflows, above about 1e290, give Inf on the default path and
+//! a finite value here).
 //! faces: (2, nvar, nc3, nc2, nc1).
 using scalar_weno5_fn = void (*)(torch::Tensor& faces, torch::Tensor const& w,
                                  torch::Tensor const& cm,

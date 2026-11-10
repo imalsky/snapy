@@ -124,6 +124,10 @@ void check(Reconstruct rec, torch::Tensor w, int dim, bool scale, double tol,
   int skip = scale && w.scalar_type() == torch::kFloat64 ? HUGE_VAR : -1;
   expect_close(ref, faces, lmax.unsqueeze(0), tol, tag + " faces", skip);
   if (skip >= 0) {
+    // the documented exception (README, SNAP_SCALAR_FUSED): Inf on the
+    // default path, the plateau on the fused path
+    EXPECT_TRUE(torch::isinf(ref.select(1, HUGE_VAR)).all().item<bool>())
+        << tag << ": the default path no longer overflows on the 1e300 plateau";
     auto huge = faces.select(1, HUGE_VAR).cpu();
     EXPECT_TRUE(torch::isfinite(huge).all().item<bool>()) << tag;
     EXPECT_LE(((huge - 1e300).abs() / 1e300).max().item<double>(), tol) << tag;

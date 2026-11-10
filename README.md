@@ -147,7 +147,9 @@ face-flux covariance correction (`SNAP_FLUX_COVARIANCE`, #289;
 `SNAP_SCALAR_FUSED=1` moves passive-scalar transport on CUDA (float64) into a
 few fused kernels (`src/scalar/scalar_fused.cu`): bit for bit the default path,
 except the WENO5 reconstruction of the tracer mass, whose weights take fewer
-divisions and differ at round-off. It is off by default. The dry density's
+divisions and differ at round-off. One exception: with scaling, a tracer
+whose weighted sum overflows (values above about 1e290) gives Inf faces on the
+default path and finite faces on the fused path. It is off by default. The dry density's
 faces and the face ratio, the upper-bound blend, the positivity limiter's
 donor-share correction and the implicit transfer's donor sweep run the default
 code on both paths. A part that cannot run fused warns once and runs the
