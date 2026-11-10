@@ -6,17 +6,19 @@ scalars, so hydro_u must be bit for bit the same. With a donor-cell (dc) tracer 
 kernel runs and the scalars must be bit for bit the same; with WENO5 they must agree to TOL of the largest
 value within RAD cells (test_scalar_fused.py). The stretched ratio column runs WENO5 only. Each fused child must launch the fused kernels its arm uses
 (torch profiler) and give exactly the fallback warnings it expects; a default child must launch none. Each
-arm must bind what it is there for, on both paths:
+arm must bind what it is there for, on both paths, observed per stage cell by cell (StageLog), and those
+records must be the same on both paths (with dc also every stage's fluxes and state, bit for bit):
   ratio      test_tracer_ratio.py's C30 column (32 stretched x1 cells, nx2 4, eos limiter, x1 Courant 30,
-             implicit scheme 1): cells whose dry air drains past its content, where the donor-share
-             correction acts (counted from the stage's dry mass fluxes); x1 is stretched, so it reconstructs
-             on the default path
-  upper      test_scalar_upper_bound_donor.py's column: a tracer at the bound in one cell; the bound's cells
-             with theta < 1 (the hit count with the bound less the count without it) must be > 0
-  donor      test_tracer_dry_convention.py's donor arm: one tracer cell under a pressure bump, the implicit
-             transfer's donor cap keeps it non-negative and the tracer total fixed
-  through    its through arm: over a cell mass moves through a cell in one stage, and a uniform tracer stays
-             uniform (the cap credits the inflow from below)
+             implicit scheme 1): limited cells, and cells whose tracer drains past its content, which only
+             the donor-share correction allows; x1 is stretched, so it reconstructs on the default path
+  upper      test_scalar_upper_bound_donor.py's column: a tracer at the bound in one cell; from the same
+             start with and without the bound, the flux faces the bound's blend moved at the first stage
+             where the two differ (all earlier states equal)
+  donor      test_tracer_dry_convention.py's donor arm: one tracer cell under a pressure bump; faces where
+             the implicit transfer's donor cap binds (WENO5; with dc the cap does not bind on this deck),
+             a non-negative tracer and a fixed tracer total
+  through    its through arm: over a cell mass moves through a cell in one stage; capped faces, and a
+             uniform tracer stays uniform (the cap credits the inflow from below)
   stratified test_scalar_stratified.py's one Scalar.forward on an exponential column (WENO5, 40 and 80
              cells): the fused faces keep its order above 4.5 (dc is not an order test there)
 
@@ -70,9 +72,77 @@ def profiled(fn):
     return out, names
 
 
+class StageLog:
+    """Per-stage observations of a Cartesian block, cell by cell, from its state before and its buffers after
+    each stage:
+      limited  interior cells whose final tracer outflow reaches their content (theta < 1)
+      drained  cells whose tracer outflow exceeds their content: theta alone cannot allow it, only the
+               donor-share correction raises theta past it
+      capped   x1 faces where the implicit transfer's donor cap binds: P = (M > 0 ? r_below : r) M against
+               held = max(s - dt D, 0) vol, swept up each column as in at::native::donor_cap
+      fluxes, state  the stage's limited scalar fluxes and scalar_s
+    limited and drained mean that only where the positivity limiter runs (eos limiter or covariance rows):
+    every arm but through, whose single column has neither."""
+
+    KINDS = ("limited", "drained", "capped", "fluxes", "state")
+
+    def __init__(self, block, v):
+        self.block, self.v = block, v
+        self.B = dict(block.named_buffers())
+        coord = block.module("coord")
+        self.dx = {3: coord.buffer("dx1f"), 2: coord.buffer("dx2f"), 1: coord.buffer("dx3f")}
+        self.M = next((b for k, b in self.B.items() if k.endswith("mass_corr")), None)
+        self.rows = {k: [] for k in self.KINDS}
+
+    def step(self, dt, stage):
+        from snapy import kIV1
+
+        s0, r0 = self.v["scalar_s"].clone(), self.v["scalar_r"].clone()
+        self.block.forward(self.v, dt, stage)
+        I = tuple([slice(None)] + [slice(3, n - 3) if n > 1 else slice(None) for n in s0.shape[1:]])
+        out, fluxes = torch.zeros_like(s0), []
+        for dim, name in ((3, "scalar.F1"), (2, "scalar.F2"), (1, "scalar.F3")):
+            F, n = self.B.get(name), s0.size(dim)
+            if F is None or F.numel() == 0 or n == 1:
+                continue
+            shape = [1, 1, 1, 1]
+            shape[dim] = n - 1
+            per_volume = (F.narrow(dim, 1, n - 1).clamp_min(0) + (-F.narrow(dim, 0, n - 1)).clamp_min(0)) / self.dx[
+                dim
+            ].narrow(0, 0, n - 1).view(shape)
+            out.narrow(dim, 0, n - 1).add_(per_volume)
+            fluxes.append(F.clone().reshape(-1))
+        drain, content = (dt * out)[I], s0[I]
+        self.rows["limited"].append(((drain > 0) & (drain >= content * (1 - 1e-10))).cpu().numpy())
+        self.rows["drained"].append((drain > content * (1 + 1e-9)).cpu().numpy())
+        self.rows["fluxes"].append(torch.cat(fluxes).cpu().numpy())
+        self.rows["state"].append(self.v["scalar_s"].cpu().numpy())
+        capped = np.zeros(0, dtype=bool)
+        if self.M is not None and self.M.numel() > 0:
+            ds = torch.zeros_like(s0)
+            ds[I] = -dt * self.B["scalar.D"][I]
+            vol = self.dx[3].view(1, 1, 1, -1) * self.dx[2].view(1, 1, -1, 1) * self.dx[1].view(1, -1, 1, 1)
+            held = (s0 + ds).clamp_min(0) * vol
+            M = self.M[kIV1 + 1]
+            r_below = torch.zeros_like(r0)
+            r_below[..., 1:] = r0[..., :-1]
+            P = torch.where(M > 0, r_below, r0) * M
+            bind = torch.zeros_like(P, dtype=torch.bool)
+            avail = held[..., 3]
+            for i in range(4, s0.size(-1) - 3):
+                q = P[..., i]
+                kept = torch.maximum(torch.minimum(q, avail), -held[..., i])
+                bind[..., i] = kept != q
+                avail = held[..., i] + kept
+            capped = bind.cpu().numpy()
+        self.rows["capped"].append(capped)
+
+    def counts(self):
+        return {k: int(sum(int(a.sum()) for a in self.rows[k])) for k in ("limited", "drained", "capped")}
+
+
 def arm_ratio(recon):
     import test_tracer_ratio as T
-    from snapy import kIDN
 
     build = T.build
 
@@ -82,28 +152,16 @@ def arm_ratio(recon):
 
     T.build = build_recon
     block, v, dt = T.column(32, 4, limiter=True, x2max=1.6e6, amp=0.55, onecol=True, courant=30.0, q=5e-3)
-    B = dict(block.named_buffers())
-    coord = block.module("coord")
-    dx1, dx2 = coord.buffer("dx1f"), coord.buffer("dx2f")
-    drained = 0
+    log = StageLog(block, v)
 
     def run():
-        nonlocal drained
         for stage in range(3):
-            rho = v["hydro_u"][kIDN].clone()
-            block.forward(v, dt, stage)
-            # the dry outflow of each interior cell (Cartesian: area / volume = 1 / width)
-            F1, F2 = B["hydro.F1"][kIDN], B["hydro.F2"][kIDN]
-            n1, n2 = rho.size(-1), rho.size(-2)
-            i, j = slice(3, n1 - 3), slice(3, n2 - 3)
-            out1 = (F1[..., 4 : n1 - 2].clamp_min(0) + (-F1[..., i]).clamp_min(0)) / dx1[i]
-            out2 = (F2[:, 4 : n2 - 2].clamp_min(0) + (-F2[:, j]).clamp_min(0)) / dx2[j].view(-1, 1)
-            drain = dt * (out1[:, j] + out2[..., i])
-            drained += int((drain > rho[:, j, i] * (1 + 1e-9)).sum())
+            log.step(dt, stage)
         return v
 
     v, kernels = profiled(run)
-    return v, kernels, {"dry cells drained past content": drained}, drained > 0
+    info = log.counts()
+    return v, kernels, info, info["drained"] > 0 and info["limited"] > 0, log
 
 
 def dry_convention_yaml():
@@ -136,19 +194,27 @@ def arm_upper(recon):
         r.zero_()
         r[..., ng + 15] = 1.0e-3
         v, _ = b.initialize({"hydro_w": w, "scalar_r": r})
-        I, smin = J.interior(c), math.inf
+        I, smin, log = J.interior(c), math.inf, StageLog(b, v)
         for _ in range(3):
             dt = b.max_time_step(v)
             for st in range(len(b.intg.stages)):
-                b.forward(v, dt, st)
+                log.step(dt, st)
                 smin = min(smin, float(v["scalar_s"][I].min()))
             b.check_redo(v)
-        return v, int(dict(b.named_buffers())["scalar.positivity_hits"].sum()), smin
+        return v, log, smin
 
-    (v, hits, smin), kernels = profiled(lambda: one(True))
-    _, hits0, _ = one(False)
-    info = {"bound hits": hits - hits0, "min s": smin}
-    return v, kernels, info, hits - hits0 > 0 and smin >= 0.0
+    (v, log, smin), kernels = profiled(lambda: one(True))
+    _, log0, _ = one(False)
+    # the same start with and without the bound: at the first stage whose fluxes differ in value (the blend
+    # also flips signed zeros), every earlier state being equal in value, the faces the bound's blend moved
+    changed, first = 0, -1
+    for n, (a, b) in enumerate(zip(log.rows["fluxes"], log0.rows["fluxes"])):
+        if (a != b).any():
+            same_before = n == 0 or np.array_equal(log.rows["state"][n - 1], log0.rows["state"][n - 1])
+            changed, first = (int((a != b).sum()) if same_before else 0), n
+            break
+    info = dict(log.counts(), **{"faces the bound moved": changed, "at stage": first, "min s": smin})
+    return v, kernels, info, changed > 0 and smin >= 0.0, log
 
 
 def arm_donor(recon):
@@ -163,7 +229,7 @@ def arm_donor(recon):
     r.zero_()
     r[..., 3 + 12] = J.R0
     v, _ = block.initialize({"hydro_w": w, "scalar_r": r})
-    I, smin = J.interior(c), math.inf
+    I, smin, log = J.interior(c), math.inf, StageLog(block, v)
     total0 = float(v["scalar_s"][I].sum())
 
     def run():
@@ -171,13 +237,16 @@ def arm_donor(recon):
         for _ in range(2):
             dt = block.max_time_step(v)
             for stage in range(len(block.intg.stages)):
-                block.forward(v, dt, stage)
+                log.step(dt, stage)
                 smin = min(smin, float(v["scalar_s"][I].min()))
         return v
 
     v, kernels = profiled(run)
     change = abs(float(v["scalar_s"][I].sum()) / total0 - 1.0)
-    return v, kernels, {"min s": smin, "total change": change}, smin >= 0.0 and change < 1e-12
+    info = dict(log.counts(), **{"min s": smin, "total change": change})
+    # measured: with dc no face of this deck reaches the cap; the through arm binds it with dc
+    capped = info["capped"] > 0 or recon == "dc"
+    return v, kernels, info, capped and smin >= 0.0 and change < 1e-12, log
 
 
 def arm_through(recon):
@@ -196,19 +265,20 @@ def arm_through(recon):
     M = next(b for k, b in dict(block.named_buffers()).items() if k.endswith("mass_corr"))
     vol = dz * 1.0e4 * float(c["geometry"]["bounds"]["x3max"]) / c["geometry"]["cells"]["nx3"]
     r0, dt = v["scalar_s"][I] / v["hydro_u"][kIDN][I[1:]], block.max_time_step(v) * 10.0
-    dev, moved = 0.0, 0.0
+    dev, moved, log = 0.0, 0.0, StageLog(block, v)
 
     def run():
         nonlocal dev, moved
         for stage in range(len(block.intg.stages)):
             cell = v["hydro_u"][kIDN][I[1:]] * vol
-            block.forward(v, dt, stage)
+            log.step(dt, stage)
             moved = max(moved, float((M[kIV1 + 1][I[1:]].abs() / cell).max()))
             dev = max(dev, float((v["scalar_s"][I] / (v["hydro_u"][kIDN][I[1:]] * r0) - 1).abs().max()))
         return v
 
     v, kernels = profiled(run)
-    return v, kernels, {"max|r/r0-1|": dev, "cell masses moved": moved}, dev <= 1e-14 and moved > 1.0
+    info = dict(log.counts(), **{"max|r/r0-1|": dev, "cell masses moved": moved})
+    return v, kernels, info, info["capped"] > 0 and dev <= 1e-14 and moved > 1.0, log
 
 
 def arm_stratified(recon):
@@ -248,13 +318,16 @@ def arm_stratified(recon):
     order, kernels = profiled(lambda: [math.log2(ds(m) / ds(2 * m)) for m in (40, 80)])
     v = {"scalar_s": torch.cat([o.reshape(-1) for o in outs]).view(1, 1, 1, -1)}
     ok = recon == "dc" or min(order) > 4.5
-    return v, kernels, {"orders": order}, ok
+    return v, kernels, {"orders": order}, ok, None
 
 
 def child(arm, recon, save):
     torch.set_default_dtype(torch.float64)
-    v, kernels, info, bound = globals()[f"arm_{arm}"](recon)
+    v, kernels, info, bound, log = globals()[f"arm_{arm}"](recon)
     np.save(save, v["scalar_s"].cpu().numpy())
+    if log is not None:
+        rows = {f"{k}{n}": a for k in StageLog.KINDS for n, a in enumerate(log.rows[k])}
+        np.savez(save[: -len(".npy")] + "_stages.npz", **rows)
     hydro = v.get("hydro_u")
     return {
         "kernels": kernels,
@@ -299,8 +372,25 @@ def main():
                 res[fused] = json.loads(rows[-1])
                 res[fused]["warnings"] = warnings_in(out.stderr)
                 arr[fused] = np.load(save)
+                stages = save[: -len(".npy")] + "_stages.npz"
+                arr[fused + "stages"] = dict(np.load(stages)) if os.path.exists(stages) else {}
             if len(res) < 2:
                 continue
+            # per stage, cell by cell: the limiter's cells, the donor-share cells and the capped faces on
+            # both paths; with dc also every stage's limited fluxes and state, bit for bit
+            s0, s1 = arr["0stages"], arr["1stages"]
+            kinds = ("limited", "drained", "capped") + (("fluxes", "state") if recon == "dc" else ())
+            if s0.keys() != s1.keys():
+                failures.append(f"{tag}: the paths logged different stages")
+            for key in sorted(s0.keys() & s1.keys()):
+                if key.rstrip("0123456789") not in kinds:
+                    continue
+                a, b = s0[key], s1[key]
+                same = a.shape == b.shape and (
+                    np.array_equal(a, b) if a.dtype == bool else np.array_equal(a.view(np.uint64), b.view(np.uint64))
+                )
+                if not same:
+                    failures.append(f"{tag}: stage record {key} differs between the paths")
             kernels, warns = expected(arm, recon)
             if res["0"]["kernels"] or res["0"]["warnings"]:
                 failures.append(f"{tag}: the default path ran {res['0']['kernels']}, warned {res['0']['warnings']}")

@@ -22,7 +22,10 @@ positivity limiter stay in libtorch on both paths. Cases:
                scalars' dry-source carry)
   box_x1rat    the box on a stretched x1 grid (x1rat 1.1): x1 has per-face rows, which the fused kernel does not
                read, so x1 must take the default path
-The positivity limiter must act (cells with theta < 1) in the PLM cases, the same cells on both paths. Each fused
+The positivity limiter must act (cells with theta < 1) in the PLM cases. After every stage each block's count of
+limited cells must be the same on both paths, and in the PLM cases its limited scalar fluxes, every face, bit for
+bit (theta itself is not visible from Python; on these curved grids the cell-by-cell limiter records of
+test_scalar_fused_limiters.py are not formed). Each fused
 child must launch the fused kernels its case uses (torch profiler, kernel names) and give exactly the fallback
 warnings its case expects; a default child must launch none of them.
 
@@ -275,11 +278,18 @@ def run(case, save):
     variables, _ = mesh.initialize(variables)
     stages = len(blocks[0].module("intg").stages)
     dt = 0.9 * float(mesh.max_time_step(variables))
+    bufs = [dict(b.named_buffers()) for b in blocks]
+    stage_hits, stage_fluxes = [], []
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
         for c in range(1, NSTEP + 1):
             mesh.set_cycle(c)
             for st in range(stages):
                 mesh.forward(variables, dt, st)
+                # each block's running count of limited cells, and its limited scalar fluxes, after every stage
+                stage_hits.append([int(B["scalar.positivity_hits"].sum()) for B in bufs])
+                stage_fluxes.append(
+                    [digest(torch.cat([B[f"scalar.F{d}"].reshape(-1) for d in (1, 2, 3)])) for B in bufs]
+                )
             err = mesh.check_redo(variables)
             assert err == 0, f"redo request {err}"
         torch.cuda.synchronize()
@@ -289,6 +299,8 @@ def run(case, save):
         "case": case,
         "fused": os.environ.get("SNAP_SCALAR_FUSED", "0"),
         "positivity_hits": hits,
+        "stage_hits": stage_hits,
+        "stage_fluxes": stage_fluxes,
         "hydro_u": [digest(v["hydro_u"]) for v in variables],
         "finite": bool(all(torch.isfinite(v["scalar_s"]).all() for v in variables)),
         "kernels": fused_kernels(prof),
@@ -351,6 +363,10 @@ def main():
             failures.append(f"{case}: non-finite tracers")
         a0, a1 = arr["0"], arr["1"]
         h0, h1 = res["0"]["positivity_hits"], res["1"]["positivity_hits"]
+        if res["0"]["stage_hits"] != res["1"]["stage_hits"]:
+            failures.append(f"{case}: the limited cells differ in some block and stage")
+        if case.endswith("_plm") and res["0"]["stage_fluxes"] != res["1"]["stage_fluxes"]:
+            failures.append(f"{case}: the limited fluxes differ in some block and stage")
         if case.endswith("_plm"):
             same = a0.shape == a1.shape and np.array_equal(a0.view(np.uint64), a1.view(np.uint64))
             print(
