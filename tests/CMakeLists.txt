@@ -501,6 +501,9 @@ if(CUDA)
   # bit for bit, the WENO5 cases to round-off
   snapy_add_python_test(test_scalar_fused
     TIMEOUT 600 LABELS "python;scalar;cuda")
+  # the same on main's tracer-limit decks: donor share, upper bound, donor cap, stratified order
+  snapy_add_python_test(test_scalar_fused_limiters
+    TIMEOUT 600 LABELS "python;scalar;cuda")
   # the fused path on a column split in x1, with the covariance (its lateral
   # flux keeps the default path there)
   snapy_add_python_test(test_scalar_cov_x1_split_fused_cuda
@@ -525,6 +528,7 @@ if(CUDA)
     test_tracer_ratio_cuda_python
     test_tracer_dry_convention_cuda_python
     test_scalar_fused_python
+    test_scalar_fused_limiters_python
     test_scalar_cov_x1_split_fused_cuda_python
     PROPERTIES SKIP_RETURN_CODE 125)
 endif()

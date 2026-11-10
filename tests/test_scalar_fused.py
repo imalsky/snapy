@@ -3,23 +3,28 @@
 
 Each case runs NSTEP rk3 steps twice, once per switch value, in child processes (the switch is read once
 per process). The flow does not see the scalars, so every block's hydro_u must be bit for bit the same. The
-fused kernels reproduce the default path's arithmetic except the WENO5 weights, which take fewer divisions:
-with WENO5 each scalar must agree to TOL relative to the largest value within RAD cells along each axis (round-off
-is relative to the values a cell's stencils combine: next to a sharp front a cell far below the front's height is a
-near-cancellation of front-sized terms); with PLM (no WENO5 kernel, every other fused kernel) bit for bit. Cases:
+fused kernels reproduce the default path's arithmetic except the WENO5 weights of the tracer mass, which take
+fewer divisions: with WENO5 each scalar must agree to TOL relative to the largest value within RAD cells along each
+axis (round-off is relative to the values a cell's stencils combine: next to a sharp front a cell far below the
+front's height is a near-cancellation of front-sized terms); with PLM (no WENO5 kernel, every other fused kernel)
+bit for bit. The dry density's faces, their quotient, the upper-bound blend and the donor-share correction of the
+positivity limiter stay in libtorch on both paths. Cases:
   sphere       six gnomonic cubed-sphere panels in one process: WENO5, implicit-scheme 9, eos limiter,
-               face-flux covariance with its centroid part, tracers over many decades
+               face-flux covariance with its centroid part, tracers over many decades; x1 is radial, so it
+               reconstructs with per-face rows on the default path
   sphere_cov0  the same with SNAP_FLUX_COVARIANCE=0 (no covariance row)
-  sphere_ub    the same with an upper bound on the tracers (its second limiter stays in libtorch)
+  sphere_ub    the same with an upper bound on the tracers
   sphere_plm   PLM tracer reconstruction (the WENO5 kernel is not used; the other kernels are)
   sphere_cov0_plm  PLM without the covariance row
-  box          a Cartesian 3-D box, periodic sides (covariance without a centroid part)
+  box          a Cartesian 3-D box, periodic sides (covariance without a centroid part); x1 fused
   box_plm      the box with PLM
   box_dry_plm  the box with PLM and a stage forcing that adds and removes dry mass (both arms of the
                scalars' dry-source carry)
   box_x1rat    the box on a stretched x1 grid (x1rat 1.1): x1 has per-face rows, which the fused kernel does not
                read, so x1 must take the default path
-The positivity limiter must act (cells with theta < 1) in the PLM cases, the same cells on both paths.
+The positivity limiter must act (cells with theta < 1) in the PLM cases, the same cells on both paths. Each fused
+child must launch the fused kernels its case uses (torch profiler, kernel names) and give exactly the fallback
+warnings its case expects; a default child must launch none of them.
 
   python test_scalar_fused.py
 """
@@ -28,6 +33,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -160,6 +166,51 @@ def digest(t):
     return hashlib.sha256(t.detach().contiguous().cpu().numpy().tobytes()).hexdigest()
 
 
+FUSED_KERNEL = re.compile(r"snap::(scalar_\w+_kernel)")
+# the fallback warnings of the fused path (scalar.cpp, meshblock.cpp), by a phrase of each
+WARNINGS = {
+    "x1 rows": "the x1 reconstruction runs the default path",
+    "not WENO5": "only WENO5 is fused",
+}
+
+
+def fused_kernels(prof):
+    """names of the fused scalar kernels (scalar_fused.cu) that a torch profile saw launched"""
+    return sorted({m.group(1) for e in prof.key_averages() for m in [FUSED_KERNEL.search(e.key)] if m})
+
+
+def warnings_in(stderr):
+    """the fallback warnings a child printed, by key; 'other' if an unknown SNAP_SCALAR_FUSED warning appeared"""
+    found = {key for key, phrase in WARNINGS.items() if phrase in stderr}
+    lines = [line for line in stderr.splitlines() if "SNAP_SCALAR_FUSED=1:" in line]
+    if any(not any(phrase in line for phrase in WARNINGS.values()) for line in lines):
+        found.add("other")
+    return found
+
+
+def expected(case):
+    """the fused kernels a case must launch, and the fallback warnings it must give"""
+    kernels = {
+        "scalar_theta_kernel",
+        "scalar_theta_scale_kernel",
+        "scalar_divergence_kernel",
+        "scalar_lateral_flux_kernel",
+        "scalar_average3_kernel",
+    }
+    warns = set()
+    if case.endswith("_plm"):
+        warns.add("not WENO5")
+    else:
+        kernels.add("scalar_weno5_faces_kernel")
+        if case.startswith("sphere") or case == "box_x1rat":
+            warns.add("x1 rows")
+    if case.startswith("sphere"):  # implicit-scheme 9
+        kernels |= {"scalar_transfer_faces_kernel", "scalar_transfer_add_kernel"}
+    if "_dry" in case:
+        kernels.add("scalar_carry_dry_kernel")
+    return kernels, warns
+
+
 def run(case, save):
     import snapy
     from snapy import Mesh, MeshOptions, kIDN, kIPR, kIV1, kIV2, kIV3
@@ -224,12 +275,14 @@ def run(case, save):
     variables, _ = mesh.initialize(variables)
     stages = len(blocks[0].module("intg").stages)
     dt = 0.9 * float(mesh.max_time_step(variables))
-    for c in range(1, NSTEP + 1):
-        mesh.set_cycle(c)
-        for st in range(stages):
-            mesh.forward(variables, dt, st)
-        err = mesh.check_redo(variables)
-        assert err == 0, f"redo request {err}"
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        for c in range(1, NSTEP + 1):
+            mesh.set_cycle(c)
+            for st in range(stages):
+                mesh.forward(variables, dt, st)
+            err = mesh.check_redo(variables)
+            assert err == 0, f"redo request {err}"
+        torch.cuda.synchronize()
     np.save(save, torch.stack([v["scalar_s"] for v in variables]).cpu().numpy())
     hits = sum(int(dict(b.named_buffers())["scalar.positivity_hits"].sum()) for b in blocks)
     return {
@@ -238,6 +291,7 @@ def run(case, save):
         "positivity_hits": hits,
         "hydro_u": [digest(v["hydro_u"]) for v in variables],
         "finite": bool(all(torch.isfinite(v["scalar_s"]).all() for v in variables)),
+        "kernels": fused_kernels(prof),
     }
 
 
@@ -278,10 +332,19 @@ def main():
                 failures.append(f"{case} fused={fused}: child exit {out.returncode}")
                 continue
             res[fused] = json.loads(rows[-1])
+            res[fused]["warnings"] = warnings_in(out.stderr)
             arr[fused] = np.load(save)
             os.unlink(save)
         if len(res) < 2:
             continue
+        kernels, warns = expected(case)
+        if res["0"]["kernels"] or res["0"]["warnings"]:
+            failures.append(f"{case}: the default path ran {res['0']['kernels']}, warned {res['0']['warnings']}")
+        if not kernels <= set(res["1"]["kernels"]):
+            failures.append(f"{case}: fused kernels {sorted(kernels - set(res['1']['kernels']))} did not run")
+        if res["1"]["warnings"] != warns:
+            failures.append(f"{case}: fallback warnings {sorted(res['1']['warnings'])}, expected {sorted(warns)}")
+        print(f"{case:16s} fused kernels run: {', '.join(res['1']['kernels'])}", flush=True)
         if res["0"]["hydro_u"] != res["1"]["hydro_u"]:
             failures.append(f"{case}: the flow differs (hydro_u)")
         if not (res["0"]["finite"] and res["1"]["finite"]):
