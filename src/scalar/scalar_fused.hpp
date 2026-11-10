@@ -76,13 +76,13 @@ using scalar_weno5_fn = void (*)(torch::Tensor& faces, torch::Tensor const& w,
 DECLARE_DISPATCH(scalar_weno5_fn, call_scalar_weno5);
 
 //! MeshBlock's implicit x1 tracer transfer, added into ds:
-//! ds += (P - P_above) / vol, P = (M > 0 ? r_below : r) * M, r_below and
-//! P_above zero past the column ends. ds, r: (nvar, nc3, nc2, nc1);
-//! m, vol: (nc3, nc2, nc1).
-using scalar_implicit_transfer_fn = void (*)(torch::Tensor& ds,
-                                             torch::Tensor const& r,
-                                             torch::Tensor const& m,
-                                             torch::Tensor const& vol);
+//! P = (M > 0 ? r_below : r) * M, each donor capped by at::native::donor_cap
+//! (faces il+1..iu) against held = max(s + ds, 0) * vol, then
+//! ds += (P - P_above) / vol, r_below and P_above zero past the column ends.
+//! ds, s, r: (nvar, nc3, nc2, nc1); m, vol: (nc3, nc2, nc1).
+using scalar_implicit_transfer_fn = void (*)(
+    torch::Tensor& ds, torch::Tensor const& s, torch::Tensor const& r,
+    torch::Tensor const& m, torch::Tensor const& vol, int il, int iu);
 DECLARE_DISPATCH(scalar_implicit_transfer_fn, call_scalar_implicit_transfer);
 
 //! The integrator's stage average w0 u0 + w1 u1 + w2 u2 (summed left to

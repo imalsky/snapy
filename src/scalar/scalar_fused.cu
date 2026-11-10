@@ -14,6 +14,8 @@
 #include <c10/cuda/CUDAGuard.h>
 
 // snap
+#include <snap/implicit/implicit_dispatch.hpp>
+
 #include "scalar_fused.hpp"
 
 // the WENO5 weights of the default path
@@ -627,23 +629,35 @@ void scalar_weno5_cuda(torch::Tensor& faces, torch::Tensor const& w,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// MeshBlock's implicit x1 tracer transfer before its donor cap: on face i
+// (below cell i) P = (M > 0 ? r[i - 1] : r[i]) * M with r[-1] = 0, and the
+// tracer each cell holds, held = max(s + ds, 0) * vol
 template <typename T>
-__global__ void scalar_implicit_transfer_kernel(
-    T* __restrict__ ds, T const* __restrict__ r, T const* __restrict__ m,
+__global__ void scalar_transfer_faces_kernel(
+    T* __restrict__ P, T* __restrict__ held, T const* __restrict__ s,
+    T const* __restrict__ ds, T const* __restrict__ r, T const* __restrict__ m,
     T const* __restrict__ vol, int n1, int64_t ncell, int64_t total) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= total) return;
   int64_t c = idx % ncell;
   int i = static_cast<int>(c % n1);
-  // P at face i and at face i + 1 (0 past the top)
   T mi = m[c];
-  T p0 = rmul(mi > T(0) ? (i >= 1 ? r[idx - 1] : T(0)) : r[idx], mi);
-  T p1 = T(0);
-  if (i + 1 < n1) {
-    T mj = m[c + 1];
-    p1 = rmul(mj > T(0) ? r[idx] : r[idx + 1], mj);
-  }
-  ds[idx] = radd(ds[idx], rdiv(rsub(p0, p1), vol[c]));
+  P[idx] = rmul(mi > T(0) ? (i >= 1 ? r[idx - 1] : T(0)) : r[idx], mi);
+  held[idx] = rmul(clamp0(radd(s[idx], ds[idx])), vol[c]);
+}
+
+// then, with P capped: ds += (P - P_above) / vol, P_above 0 past the top
+template <typename T>
+__global__ void scalar_transfer_add_kernel(T* __restrict__ ds,
+                                           T const* __restrict__ P,
+                                           T const* __restrict__ vol, int n1,
+                                           int64_t ncell, int64_t total) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  int64_t c = idx % ncell;
+  int i = static_cast<int>(c % n1);
+  T above = i + 1 < n1 ? P[idx + 1] : T(0);
+  ds[idx] = radd(ds[idx], rdiv(rsub(P[idx], above), vol[c]));
 }
 
 template <typename T>
@@ -658,33 +672,45 @@ __global__ void scalar_average3_kernel(T* __restrict__ out,
       radd(radd(rmul(w0, u0[idx]), rmul(w1, u1[idx])), rmul(w2, u2[idx]));
 }
 
-void scalar_implicit_transfer_cuda(torch::Tensor& ds, torch::Tensor const& r,
+void scalar_implicit_transfer_cuda(torch::Tensor& ds, torch::Tensor const& s,
+                                   torch::Tensor const& r,
                                    torch::Tensor const& m,
-                                   torch::Tensor const& vol) {
+                                   torch::Tensor const& vol, int il, int iu) {
   at::cuda::CUDAGuard device_guard(ds.device());
   char const* who = "scalar_implicit_transfer";
-  check_operands(who, ds, {&r, &m, &vol});
-  TORCH_CHECK(ds.is_contiguous() && r.is_contiguous() && m.is_contiguous() &&
-                  vol.is_contiguous() && r.dim() == 4 &&
-                  ds.sizes() == r.sizes() && m.sizes() == r.sizes().slice(1) &&
-                  vol.sizes() == m.sizes(),
+  check_operands(who, ds, {&s, &r, &m, &vol});
+  TORCH_CHECK(ds.is_contiguous() && s.is_contiguous() && r.is_contiguous() &&
+                  m.is_contiguous() && vol.is_contiguous() && r.dim() == 4 &&
+                  ds.sizes() == r.sizes() && s.sizes() == r.sizes() &&
+                  m.sizes() == r.sizes().slice(1) && vol.sizes() == m.sizes(),
               who,
-              ": contiguous ds, r (nvar, nc3, nc2, nc1) and M, vol (nc3, nc2, "
-              "nc1) expected");
+              ": contiguous ds, s, r (nvar, nc3, nc2, nc1) and M, vol (nc3, "
+              "nc2, nc1) expected");
+  TORCH_CHECK(0 <= il && il <= iu && iu < r.size(3), who, ": x1 interior ", il,
+              "..", iu, " outside the ", r.size(3), " cells");
   int64_t total = r.numel();
   if (total == 0) return;
   int n1 = int_extent(r.size(3), who);
   int threads = 256;
   int64_t blocks = flat_blocks(total, threads, who);
   auto stream = at::cuda::getCurrentCUDAStream();
-  AT_DISPATCH_FLOATING_TYPES(
-      r.scalar_type(), "scalar_implicit_transfer_cuda", [&] {
-        scalar_implicit_transfer_kernel<scalar_t>
-            <<<blocks, threads, 0, stream>>>(
-                ds.data_ptr<scalar_t>(), r.data_ptr<scalar_t>(),
-                m.data_ptr<scalar_t>(), vol.data_ptr<scalar_t>(), n1, m.numel(),
-                total);
-      });
+  auto P = torch::empty_like(r);
+  auto held = torch::empty_like(r);
+  AT_DISPATCH_FLOATING_TYPES(r.scalar_type(), "scalar_transfer_faces", [&] {
+    scalar_transfer_faces_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+        P.data_ptr<scalar_t>(), held.data_ptr<scalar_t>(),
+        s.data_ptr<scalar_t>(), ds.data_ptr<scalar_t>(),
+        r.data_ptr<scalar_t>(), m.data_ptr<scalar_t>(),
+        vol.data_ptr<scalar_t>(), n1, m.numel(), total);
+  });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  // the default path's own column sweep (implicit_dispatch.cu)
+  at::native::donor_cap(P.device().type(), P, held, il, iu);
+  AT_DISPATCH_FLOATING_TYPES(r.scalar_type(), "scalar_transfer_add", [&] {
+    scalar_transfer_add_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+        ds.data_ptr<scalar_t>(), P.data_ptr<scalar_t>(),
+        vol.data_ptr<scalar_t>(), n1, m.numel(), total);
+  });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

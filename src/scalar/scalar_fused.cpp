@@ -49,7 +49,8 @@ void scalar_weno5_unsupported(torch::Tensor&, torch::Tensor const&,
 }
 void scalar_implicit_transfer_unsupported(torch::Tensor&, torch::Tensor const&,
                                           torch::Tensor const&,
-                                          torch::Tensor const&) {
+                                          torch::Tensor const&,
+                                          torch::Tensor const&, int, int) {
   TORCH_CHECK(false, "the fused scalar path runs on CUDA devices only");
 }
 void scalar_average3_unsupported(torch::Tensor&, torch::Tensor const&,
